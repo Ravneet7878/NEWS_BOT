@@ -1,0 +1,52 @@
+steps:
+  # ── api service ──────────────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=SERVICE=api
+      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - news-bot-api
+      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA
+      - --region=asia-south1
+      - --service-account=news-bot-api-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1
+      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,WEBHOOK_SECRET_TOKEN=webhook-secret-token:latest,ADMIN_TELEGRAM_ID=admin-telegram-id:latest
+      - --allow-unauthenticated
+      - --memory=512Mi
+      - --max-instances=1
+
+  # ── worker service ────────────────────────────────────────────────────────
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --build-arg=SERVICE=worker
+      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA]
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - news-bot-worker
+      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA
+      - --region=asia-south1
+      - --service-account=news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1
+      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest
+      - --no-allow-unauthenticated
+      - --memory=1Gi
+      - --max-instances=1
