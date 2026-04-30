@@ -1,6 +1,5 @@
 """PTB ConversationHandler for invite-code-gated user onboarding."""
 
-import logging
 import re
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,8 +9,9 @@ from telegram.ext import ContextTypes, ConversationHandler
 
 import shared.database as db
 from shared.models import OnboardingState, User
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Exported state constants consumed by api/main.py
 AWAITING_TOPICS: int = 1

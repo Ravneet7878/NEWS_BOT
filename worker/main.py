@@ -2,9 +2,10 @@
 
 import asyncio
 import json
-import logging
+import re
 from datetime import datetime
 
+import httpx
 import vertexai  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException, Request
 from google.adk.runners import Runner  # type: ignore[import-untyped]
@@ -14,11 +15,13 @@ from google.genai.types import Content, Part  # type: ignore[import-untyped]
 import shared.database as db
 from shared.config import settings
 from shared.models import User
+from utils.logging import get_logger, setup_logging
 from worker.pipeline.root import root_agent
+from worker.tools.firestore_tools import get_user_preferences
 from worker.tools.telegram_tools import send_digest_message, send_error_to_user
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+setup_logging()
+logger = get_logger(__name__)
 
 # Initialise Vertex AI once at module import — worker only
 vertexai.init(project=settings.GCP_PROJECT_ID, location=settings.VERTEX_AI_LOCATION)
@@ -35,6 +38,47 @@ app = FastAPI(title="news-bot-worker")
 
 
 # ---------------------------------------------------------------------------
+# URL validation
+# ---------------------------------------------------------------------------
+
+_URL_CHECK_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+
+
+async def _validate_url(client: httpx.AsyncClient, url: str) -> bool:
+    """HEAD-check a URL; falls back to GET on 405. Returns True if reachable."""
+    if not (isinstance(url, str) and url.startswith("http")):
+        return False
+    try:
+        resp = await client.head(url, timeout=5.0)
+        if resp.status_code == 405:
+            resp = await client.get(url, timeout=5.0)
+        return resp.status_code < 400
+    except Exception:
+        return False
+
+
+async def _clean_digest_urls(articles: list[dict]) -> list[dict]:
+    """Validate every article URL in parallel; clear broken or unreachable ones."""
+    async with httpx.AsyncClient(
+        headers=_URL_CHECK_HEADERS, follow_redirects=True
+    ) as client:
+        results = await asyncio.gather(
+            *[_validate_url(client, a.get("url", "")) for a in articles]
+        )
+    cleaned = []
+    for article, ok in zip(articles, results):
+        if not ok:
+            logger.warning(
+                "Clearing invalid URL for '%s': %s",
+                article.get("title", ""),
+                article.get("url", ""),
+            )
+            article = {**article, "url": ""}
+        cleaned.append(article)
+    return cleaned
+
+
+# ---------------------------------------------------------------------------
 # Per-user pipeline
 # ---------------------------------------------------------------------------
 
@@ -42,9 +86,11 @@ app = FastAPI(title="news-bot-worker")
 async def process_user(user: User) -> None:
     """Run the full ADK pipeline for a single user and deliver the digest."""
     try:
+        prefs = await get_user_preferences(user.telegram_id)
         session = await session_service.create_session(
             app_name="news_bot",
             user_id=user.telegram_id,
+            state={"user_preferences": prefs},
         )
 
         message = Content(
@@ -52,23 +98,37 @@ async def process_user(user: User) -> None:
             parts=[Part(text=f"telegram_id: {user.telegram_id}")],
         )
 
-        final_digest_json: str = "[]"
-        async for event in adk_runner.run_async(
+        # Drain all events — SequentialAgent fires is_final_response() per sub-agent,
+        # so breaking early would stop the pipeline after the first agent.
+        async for _ in adk_runner.run_async(
             user_id=user.telegram_id,
             session_id=session.id,
             new_message=message,
         ):
-            if event.is_final_response():
-                # Read output from session state — more reliable than parsing LLM text
-                state = await session_service.get_session(
-                    app_name="news_bot",
-                    user_id=user.telegram_id,
-                    session_id=session.id,
-                )
-                raw = state.state.get("final_digest", "[]")
-                final_digest_json = raw if isinstance(raw, str) else json.dumps(raw)
-                break
+            pass
 
+        state = await session_service.get_session(
+            app_name="news_bot",
+            user_id=user.telegram_id,
+            session_id=session.id,
+        )
+        logger.info("session state keys: %s", list(state.state.keys()))
+        raw = state.state.get("final_digest", "[]")
+        if isinstance(raw, str):
+            # Strip markdown code fences the model sometimes wraps output in
+            raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+            raw = re.sub(r"\s*```$", "", raw.strip())
+        final_digest_json: str = raw if isinstance(raw, str) else json.dumps(raw)
+
+        # Validate every URL in parallel — clear broken/hallucinated ones before sending
+        try:
+            articles = json.loads(final_digest_json)
+            articles = await _clean_digest_urls(articles)
+            final_digest_json = json.dumps(articles)
+        except (json.JSONDecodeError, TypeError):
+            pass  # send_digest_message handles malformed JSON gracefully
+
+        logger.info("final_digest for user %s: %s", user.telegram_id, final_digest_json[:500])
         await send_digest_message(user.telegram_id, final_digest_json)
         await db.update_user(
             user.telegram_id,

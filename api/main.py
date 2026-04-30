@@ -1,6 +1,5 @@
 """API FastAPI service — hosts the Telegram webhook."""
 
-import logging
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
@@ -17,9 +16,10 @@ from telegram.ext import (
 
 from api.handlers import admin, commands, feedback, onboarding
 from shared.config import settings
+from utils.logging import get_logger, setup_logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+setup_logging()
+logger = get_logger(__name__)
 
 
 @asynccontextmanager

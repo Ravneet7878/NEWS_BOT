@@ -1,6 +1,5 @@
 """PTB command handlers for registered users."""
 
-import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -9,8 +8,9 @@ from telegram.ext import ContextTypes
 
 import shared.database as db
 from api.handlers.onboarding import _parse_hour, _local_to_utc_hour
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def _require_user(update: Update) -> bool:

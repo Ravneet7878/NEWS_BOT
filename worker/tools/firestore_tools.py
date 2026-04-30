@@ -1,10 +1,9 @@
 """ADK-compatible Firestore tools for the worker pipeline."""
 
-import logging
-
 import shared.database as db
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def get_user_preferences(telegram_id: str) -> dict:

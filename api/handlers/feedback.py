@@ -1,6 +1,5 @@
 """PTB CallbackQueryHandler for 👍/👎 inline feedback buttons."""
 
-import logging
 from datetime import date, datetime
 
 from telegram import Update
@@ -8,8 +7,9 @@ from telegram.ext import ContextTypes
 
 import shared.database as db
 from shared.models import Feedback
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

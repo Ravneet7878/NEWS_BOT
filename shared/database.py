@@ -1,16 +1,17 @@
 """Async Firestore helper functions — module-level singleton, no wrapper classes."""
 
-import logging
 from datetime import datetime
 
 from google.cloud.firestore_v1.async_client import AsyncClient  # type: ignore[import-untyped]
 
+from shared.config import settings
 from shared.models import Feedback, InviteCode, OnboardingState, User
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # Module-level singleton — one connection pool for the lifetime of the process
-_db: AsyncClient = AsyncClient()
+_db: AsyncClient = AsyncClient(project=settings.GCP_PROJECT_ID)
 
 _USERS_COL = "users"
 _INVITE_CODES_COL = "invite_codes"

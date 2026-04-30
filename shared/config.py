@@ -1,11 +1,13 @@
 """Application configuration loaded from environment variables and GCP Secret Manager."""
 
-import logging
+import os
 from functools import lru_cache
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-logger = logging.getLogger(__name__)
+from utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def load_secret(name: str, project_id: str) -> str:
@@ -31,12 +33,25 @@ class Settings(BaseSettings):
     # Populated in model_post_init from Secret Manager (or .env for local dev)
     TELEGRAM_BOT_TOKEN: str = ""
 
+    # ADK backend selection — set to "1" locally to use Vertex AI instead of Gemini API
+    GOOGLE_GENAI_USE_VERTEXAI: str = ""
+    GOOGLE_CLOUD_PROJECT: str = ""
+    GOOGLE_CLOUD_LOCATION: str = ""
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     def model_post_init(self, __context: object) -> None:
         # Allow .env overrides for local development; only hit Secret Manager when empty
         if not self.TELEGRAM_BOT_TOKEN:
             self.TELEGRAM_BOT_TOKEN = load_secret("TELEGRAM_BOT_TOKEN", self.GCP_PROJECT_ID)
+
+        # Propagate ADK env vars so the ADK client picks them up from os.environ
+        if self.GOOGLE_GENAI_USE_VERTEXAI:
+            os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = self.GOOGLE_GENAI_USE_VERTEXAI
+        if self.GOOGLE_CLOUD_PROJECT:
+            os.environ["GOOGLE_CLOUD_PROJECT"] = self.GOOGLE_CLOUD_PROJECT
+        if self.GOOGLE_CLOUD_LOCATION:
+            os.environ["GOOGLE_CLOUD_LOCATION"] = self.GOOGLE_CLOUD_LOCATION
 
 
 @lru_cache(maxsize=1)

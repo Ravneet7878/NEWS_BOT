@@ -1,7 +1,6 @@
 """PTB command handlers for admin-only operations."""
 
 import asyncio
-import logging
 import secrets
 
 from telegram import Update
@@ -10,8 +9,9 @@ from telegram.ext import ContextTypes
 import shared.database as db
 from shared.config import settings
 from shared.models import OnboardingState
+from utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _is_admin(update: Update) -> bool:
