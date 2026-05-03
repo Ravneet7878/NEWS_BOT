@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 
 import shared.database as db
 from api.handlers.onboarding import _parse_hour, _local_to_utc_hour
+from shared.config import settings
 from utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -81,14 +82,14 @@ async def handle_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         raw = " ".join(context.args or [])
         if not raw.strip():
             await update.message.reply_text(
-                "Usage: /topics Technology, Finance, Climate\n"
-                "Send 1–10 comma-separated topics."
+                f"Usage: /topics Technology, Finance, Climate\n"
+                f"Send 1–{settings.MAX_TOPICS} comma-separated topics."
             )
             return
 
         new_topics = list(dict.fromkeys(t.strip() for t in raw.split(",") if t.strip()))
-        if not 1 <= len(new_topics) <= 10:
-            await update.message.reply_text("Please provide between 1 and 10 topics.")
+        if not 1 <= len(new_topics) <= settings.MAX_TOPICS:
+            await update.message.reply_text(f"Please provide between 1 and {settings.MAX_TOPICS} topics.")
             return
 
         # Preserve existing weights where the topic name matches

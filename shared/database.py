@@ -2,6 +2,7 @@
 
 from datetime import datetime
 
+from google.cloud.firestore_v1 import FieldFilter  # type: ignore[import-untyped]
 from google.cloud.firestore_v1.async_client import AsyncClient  # type: ignore[import-untyped]
 
 from shared.config import settings
@@ -122,9 +123,9 @@ async def get_active_users_for_hour(utc_hour: int) -> list[User]:
     try:
         query = (
             _db.collection(_USERS_COL)
-            .where("is_active", "==", True)
-            .where("is_paused", "==", False)
-            .where("delivery_hour_utc", "==", utc_hour)
+            .where(filter=FieldFilter("is_active", "==", True))
+            .where(filter=FieldFilter("is_paused", "==", False))
+            .where(filter=FieldFilter("delivery_hour_utc", "==", utc_hour))
         )
         docs = query.stream()
         users: list[User] = []
@@ -214,7 +215,7 @@ async def get_all_users() -> list[User]:
 async def get_all_active_users() -> list[User]:
     """Return all is_active users — used by admin /broadcast command."""
     try:
-        query = _db.collection(_USERS_COL).where("is_active", "==", True)
+        query = _db.collection(_USERS_COL).where(filter=FieldFilter("is_active", "==", True))
         docs = query.stream()
         users: list[User] = []
         async for doc in docs:

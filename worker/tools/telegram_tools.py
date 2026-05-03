@@ -16,7 +16,6 @@ _bot: Bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
 _MAX_MESSAGE_LENGTH = 4096
 _CALLBACK_MAX = 64  # Telegram hard limit on callback_data bytes
-_SECTION_HEADINGS = ["Key Points", "What's happening", "The gist", "Quick breakdown"]
 
 
 def _escape_with_bold(text: str) -> str:
@@ -25,12 +24,24 @@ def _escape_with_bold(text: str) -> str:
     return "".join(p if p in ("<b>", "</b>") else html.escape(p) for p in parts)
 
 
+def _byte_truncate(s: str, max_bytes: int) -> str:
+    """Truncate s so its UTF-8 encoding fits within max_bytes."""
+    enc = s.encode("utf-8")
+    if len(enc) <= max_bytes:
+        return s
+    # Drop any incomplete multi-byte sequence at the cut point
+    return enc[:max_bytes].decode("utf-8", errors="ignore")
+
+
 def _build_feedback_keyboard(topic: str, title: str) -> InlineKeyboardMarkup:
     """Build the 👍/👎 inline keyboard for a single article."""
-    prefix = "feedback:more:"  # "more" and "less" are the same length (14 chars)
-    budget = _CALLBACK_MAX - len(prefix) - 1  # -1 for ":" between topic and title → 49
-    safe_topic = topic.replace(":", "-")[:20]
-    safe_title = title.replace(":", "-")[: budget - len(safe_topic)]
+    # Budget is in BYTES — Telegram enforces a 64-byte limit on callback_data.
+    # "feedback:more:" = 14 bytes; ":" separator = 1 byte → 49 bytes left for topic+title.
+    budget = _CALLBACK_MAX - 14 - 1
+    safe_topic = _byte_truncate(topic.replace(":", "-"), min(20, budget))
+    safe_title = _byte_truncate(
+        title.replace(":", "-"), budget - len(safe_topic.encode("utf-8"))
+    )
     return InlineKeyboardMarkup(
         [
             [
@@ -52,24 +63,19 @@ def _build_article_body(
     meta_line: str,
     points: list[str],
     why: str,
-    heading_index: int = 0,
 ) -> str:
-    heading = _SECTION_HEADINGS[heading_index % len(_SECTION_HEADINGS)]
     parts: list[str] = []
     if title:
         parts.append(f"🔥 <b>{html.escape(title)}</b>")
-    parts.append("")
     if meta_line:
         parts.append(meta_line)
     if points:
         parts.append("")
-        parts.append(f"<b>{heading}:</b>")
         for pt in points:
             parts.append(f"• {_escape_with_bold(pt)}")
     if why:
         parts.append("")
-        parts.append("💡 <b>Why it matters:</b>")
-        parts.append(_escape_with_bold(why))
+        parts.append(f"💡 <b>Why it matters:</b> {_escape_with_bold(why)}")
     return "\n".join(parts).strip()
 
 
@@ -99,6 +105,8 @@ async def send_digest_message(telegram_id: str, digest_text: str) -> dict:
             topic: str = article.get("topic", "")
             source: str = article.get("source", "")
             url: str = article.get("url", "")
+            citation_status: str = article.get("citation_status", "valid")
+            published_at: str = article.get("published_at", "")
             points: list[str] = list(article.get("summary_points") or [])
             why: str = article.get("why_it_matters", "")
 
@@ -122,29 +130,48 @@ async def send_digest_message(telegram_id: str, digest_text: str) -> dict:
 
             # URL validation — only link if it starts with http:// or https://
             url_valid = isinstance(url, str) and url.startswith(("http://", "https://"))
+            safe_url = html.escape(url, quote=True) if url_valid else ""
 
-            # Combined topic + source meta line
-            if source and url_valid:
-                meta_line = f'🏷 <b>{html.escape(topic)}</b> • 📰 <a href="{url}">{html.escape(source)}</a>'
+            date_str = f"Date: {published_at}" if published_at else "Date: Unknown"
+
+            # Combined topic + source + date meta line
+            if source and url_valid and citation_status == "valid":
+                meta_line = (
+                    f'🏷 <b>{html.escape(topic)}</b> • 📰 <a href="{safe_url}">{html.escape(source)}</a>'
+                    f" | {html.escape(date_str)}"
+                )
+            elif source and citation_status == "blocked":
+                meta_line = (
+                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
+                    f"(citation unavailable: publisher blocked verification) | {html.escape(date_str)}"
+                )
+            elif source and not url_valid:
+                meta_line = (
+                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
+                    f"(citation unavailable: no URL) | {html.escape(date_str)}"
+                )
             elif source:
-                meta_line = f'🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)}'
+                meta_line = (
+                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)}"
+                    f" | {html.escape(date_str)}"
+                )
             elif topic:
-                meta_line = f'🏷 <b>{html.escape(topic)}</b>'
+                meta_line = f"🏷 <b>{html.escape(topic)}</b> | {html.escape(date_str)}"
             else:
-                meta_line = ""
+                meta_line = html.escape(date_str) if published_at else ""
 
-            body = _build_article_body(title, meta_line, points, why, heading_index=messages_sent)
+            body = _build_article_body(title, meta_line, points, why)
 
             # Trim strategy 1: remove trailing summary_points one at a time
             while len(body) > _MAX_MESSAGE_LENGTH and len(points) > 1:
                 points.pop()
-                body = _build_article_body(title, meta_line, points, why, heading_index=messages_sent)
+                body = _build_article_body(title, meta_line, points, why)
 
             # Trim strategy 2: shorten why_it_matters
             if len(body) > _MAX_MESSAGE_LENGTH:
                 while len(body) > _MAX_MESSAGE_LENGTH and len(why) > 10:
                     why = why[:-10]
-                    body = _build_article_body(title, meta_line, points, why + "…", heading_index=messages_sent)
+                    body = _build_article_body(title, meta_line, points, why + "…")
 
             # Hard fallback
             if len(body) > _MAX_MESSAGE_LENGTH:

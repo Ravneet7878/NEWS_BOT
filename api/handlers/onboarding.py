@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import ContextTypes, ConversationHandler
 
 import shared.database as db
+from shared.config import settings
 from shared.models import OnboardingState, User
 from utils.logging import get_logger
 
@@ -144,7 +145,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "What topics would you like to follow?\n"
             "Send a comma-separated list, e.g.:\n"
             "  Technology, Finance, Climate, India\n\n"
-            "You can list 1–10 topics."
+            f"You can list 1–{settings.MAX_TOPICS} topics."
         )
         return AWAITING_TOPICS
 
@@ -168,9 +169,9 @@ async def handle_topics_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         raw = update.message.text.strip()
         topics = list(dict.fromkeys(t.strip() for t in raw.split(",") if t.strip()))
 
-        if not 1 <= len(topics) <= 10:
+        if not 1 <= len(topics) <= settings.MAX_TOPICS:
             await update.message.reply_text(
-                "Please send between 1 and 10 topics, separated by commas."
+                f"Please send between 1 and {settings.MAX_TOPICS} topics, separated by commas."
             )
             return AWAITING_TOPICS
 

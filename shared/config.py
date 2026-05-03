@@ -32,6 +32,10 @@ class Settings(BaseSettings):
 
     # Populated in model_post_init from Secret Manager (or .env for local dev)
     TELEGRAM_BOT_TOKEN: str = ""
+    NEWSDATA_API_KEY: str = ""
+
+    DIGEST_MAX_ARTICLES: int = 7
+    MAX_TOPICS: int = 7
 
     # ADK backend selection — set to "1" locally to use Vertex AI instead of Gemini API
     GOOGLE_GENAI_USE_VERTEXAI: str = ""
@@ -44,6 +48,8 @@ class Settings(BaseSettings):
         # Allow .env overrides for local development; only hit Secret Manager when empty
         if not self.TELEGRAM_BOT_TOKEN:
             self.TELEGRAM_BOT_TOKEN = load_secret("TELEGRAM_BOT_TOKEN", self.GCP_PROJECT_ID)
+        if not self.NEWSDATA_API_KEY:
+            self.NEWSDATA_API_KEY = load_secret("NEWSDATA_API_KEY", self.GCP_PROJECT_ID)
 
         # Propagate ADK env vars so the ADK client picks them up from os.environ
         if self.GOOGLE_GENAI_USE_VERTEXAI:

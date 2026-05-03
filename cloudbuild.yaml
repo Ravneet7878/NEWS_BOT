@@ -46,7 +46,7 @@ steps:
       - --region=asia-south1
       - --service-account=news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com
       - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1
-      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest
+      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,NEWSDATA_API_KEY=NEWSDATA_API_KEY:latest
       - --no-allow-unauthenticated
       - --memory=1Gi
       - --max-instances=1

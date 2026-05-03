@@ -3,12 +3,10 @@
 from google.adk.agents import SequentialAgent  # type: ignore[import-untyped]
 
 from worker.pipeline.curator import curator_agent
-from worker.pipeline.fetcher import fetcher_agent
 from worker.pipeline.summariser import summariser_agent
 
-# ADK requires a module-level variable named exactly `root_agent`
 root_agent = SequentialAgent(
     name="news_digest_pipeline",
-    description="Fetches, curates, and summarises personalised news for a single user.",
-    sub_agents=[fetcher_agent, curator_agent, summariser_agent],
+    description="Curates and summarises pre-fetched news for a single user.",
+    sub_agents=[curator_agent, summariser_agent],
 )

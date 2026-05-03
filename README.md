@@ -13,8 +13,8 @@ Telegram ──► api (Cloud Run, public)
                 └─► Firestore (user data, invite codes, feedback)
 
 Cloud Scheduler ──► worker (Cloud Run, private)
+                        ├─► fetch_articles_for_user (Python, pre-pipeline — google_search + Firestore prefs)
                         └─► ADK Pipeline (SequentialAgent)
-                                ├─► news_fetcher  (google_search + Firestore prefs)
                                 ├─► news_curator  (dedup + scoring)
                                 └─► news_summariser (prose summaries)
                         └─► Telegram Bot API (deliver digest)
@@ -28,7 +28,7 @@ The `api` service handles real-time Telegram webhook events and must respond wit
 1. `api` receives `/start <code>` → validates invite → creates user in Firestore
 2. Cloud Scheduler hits `POST /run` on `worker` every hour (UTC)
 3. Worker queries Firestore for users with `delivery_hour_utc == current_hour`
-4. ADK SequentialAgent: fetcher → curator → summariser (state flows via session state keys)
+4. `fetch_articles_for_user` (Python) populates raw_articles → ADK SequentialAgent: curator → summariser (state flows via session state keys)
 5. Worker reads `final_digest` from session state and delivers via Telegram Bot API
 6. User taps 👍/👎 → `api` handles callback → updates topic weights in Firestore
 
