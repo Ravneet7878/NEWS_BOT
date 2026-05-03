@@ -8,6 +8,7 @@ from google.cloud.firestore_v1.async_client import AsyncClient  # type: ignore[i
 from shared.config import settings
 from shared.models import Feedback, InviteCode, OnboardingState, User
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -32,7 +33,7 @@ async def get_user(telegram_id: str) -> User | None:
             return None
         return User(**doc.to_dict())
     except Exception as exc:
-        logger.error("get_user(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("get_user(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         raise
 
 
@@ -43,7 +44,7 @@ async def create_user(user: User) -> None:
             user.model_dump(mode="json")
         )
     except Exception as exc:
-        logger.error("create_user(%s) failed: %s", user.telegram_id, exc, exc_info=True)
+        logger.error("create_user(%s) failed: %s", public_user_ref(user.telegram_id), exc, exc_info=True)
         raise
 
 
@@ -52,7 +53,7 @@ async def update_user(telegram_id: str, **fields: object) -> None:
     try:
         await _db.collection(_USERS_COL).document(telegram_id).update(fields)
     except Exception as exc:
-        logger.error("update_user(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("update_user(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         raise
 
 
@@ -61,7 +62,7 @@ async def delete_user(telegram_id: str) -> None:
     try:
         await _db.collection(_USERS_COL).document(telegram_id).delete()
     except Exception as exc:
-        logger.error("delete_user(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("delete_user(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         raise
 
 
@@ -166,7 +167,7 @@ async def update_topic_weights(
     try:
         user = await get_user(telegram_id)
         if user is None:
-            logger.warning("update_topic_weights: user %s not found", telegram_id)
+            logger.warning("update_topic_weights: user %s not found", public_user_ref(telegram_id))
             return
 
         weights = dict(user.topic_weights)
@@ -186,7 +187,7 @@ async def update_topic_weights(
         await update_user(telegram_id, topic_weights=weights)
     except Exception as exc:
         logger.error(
-            "update_topic_weights(%s, %s) failed: %s", telegram_id, topic, exc, exc_info=True
+            "update_topic_weights(%s, %s) failed: %s", public_user_ref(telegram_id), topic, exc, exc_info=True
         )
         raise
 

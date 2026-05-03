@@ -10,7 +10,9 @@ from telegram.ext import ContextTypes, ConversationHandler
 import shared.database as db
 from shared.config import settings
 from shared.models import OnboardingState, User
+from utils.guardrails import sanitize_topics
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -150,7 +152,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return AWAITING_TOPICS
 
     except Exception as exc:
-        logger.error("handle_start failed for user %s: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_start failed for user %s: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
         return ConversationHandler.END
 
@@ -167,12 +169,11 @@ async def handle_topics_input(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         raw = update.message.text.strip()
-        topics = list(dict.fromkeys(t.strip() for t in raw.split(",") if t.strip()))
-
-        if not 1 <= len(topics) <= settings.MAX_TOPICS:
-            await update.message.reply_text(
-                f"Please send between 1 and {settings.MAX_TOPICS} topics, separated by commas."
-            )
+        raw_split = [t.strip() for t in raw.split(",")]
+        try:
+            topics = sanitize_topics(raw_split)
+        except ValueError as policy_err:
+            await update.message.reply_text(str(policy_err))
             return AWAITING_TOPICS
 
         weights = {topic: 1.0 for topic in topics}
@@ -192,7 +193,7 @@ async def handle_topics_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         return AWAITING_TIME
 
     except Exception as exc:
-        logger.error("handle_topics_input failed for user %s: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_topics_input failed for user %s: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
         return AWAITING_TOPICS
 
@@ -238,6 +239,6 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return ConversationHandler.END
 
     except Exception as exc:
-        logger.error("handle_time_input failed for user %s: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_time_input failed for user %s: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
         return AWAITING_TIME

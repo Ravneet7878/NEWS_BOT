@@ -14,7 +14,9 @@ from google.genai.types import Content, Part  # type: ignore[import-untyped]
 import shared.database as db
 from shared.config import settings
 from shared.models import User
+from utils.guardrails import validate_curated_articles, validate_final_digest
 from utils.logging import get_logger, setup_logging
+from utils.privacy import public_user_ref
 from worker.pipeline.curator import curator_agent
 from worker.pipeline.fetcher import fetch_articles_for_user
 from worker.pipeline.summariser import summariser_agent
@@ -41,6 +43,31 @@ summariser_runner = Runner(
 )
 
 app = FastAPI(title="news-bot-worker")
+
+
+def _fix_invalid_unicode_escapes(s: str) -> str:
+    """Escape bare \\u not followed by 4 hex digits so json.loads won't reject them."""
+    return re.sub(r"\\u(?![0-9a-fA-F]{4})", r"\\\\u", s)
+
+
+def _parse_llm_json(raw: str) -> list:
+    """Strip markdown fences, fix bad unicode escapes, then parse LLM JSON to a list."""
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
+    raw = re.sub(r"\s*```$", "", raw.strip())
+    if not raw.strip():
+        return []
+    for candidate in (raw, _fix_invalid_unicode_escapes(raw)):
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            pass
+        m = re.search(r"\[[\s\S]*\]", candidate)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return []
 
 
 def _normalize_articles(raw: object) -> list[dict]:
@@ -212,21 +239,31 @@ async def process_user(user: User) -> None:
         prefetch_state: dict = {"user_preferences": prefs}
         await fetch_articles_for_user(prefs, prefetch_state)
 
+        # Build source-of-truth index from fetcher output (used by validation gates)
+        raw_articles_list = _normalize_articles(
+            json.loads(prefetch_state.get("raw_articles", "[]"))
+        )
+        raw_articles_by_id: dict[str, dict] = {
+            a["article_id"]: a for a in raw_articles_list if a.get("article_id")
+        }
+        valid_ids: set[str] = set(raw_articles_by_id.keys())
+
         # 2. Session pre-populated with raw_articles + URL/image/citation/date maps
+        _user_ref = public_user_ref(user.telegram_id)
         session = await session_service.create_session(
             app_name="news_bot",
-            user_id=user.telegram_id,
+            user_id=_user_ref,
             state=prefetch_state,
         )
 
         trigger = Content(
             role="user",
-            parts=[Part(text=f"telegram_id: {user.telegram_id}")],
+            parts=[Part(text=f"user_ref: {public_user_ref(user.telegram_id)}")],
         )
 
         # 3. Curator pass — scores and deduplicates raw_articles → curated_articles
         async for _ in curator_runner.run_async(
-            user_id=user.telegram_id,
+            user_id=_user_ref,
             session_id=session.id,
             new_message=trigger,
         ):
@@ -236,25 +273,19 @@ async def process_user(user: User) -> None:
         #    before summariser so we don't waste tokens on articles we'll drop
         live = await session_service.get_session(
             app_name="news_bot",
-            user_id=user.telegram_id,
+            user_id=_user_ref,
             session_id=session.id,
         )
         raw_curated = live.state.get("curated_articles", "[]")
         if isinstance(raw_curated, str):
-            raw_curated = re.sub(r"^```(?:json)?\s*", "", raw_curated.strip())
-            raw_curated = re.sub(r"\s*```$", "", raw_curated.strip())
-            if not raw_curated.strip():
-                logger.warning("Curator returned empty output for user %s — skipping", user.telegram_id)
-                parsed_curated: list = []
-            else:
-                try:
-                    parsed_curated = json.loads(raw_curated)
-                except (json.JSONDecodeError, ValueError):
-                    m = re.search(r"\[[\s\S]*\]", raw_curated)
-                    parsed_curated = json.loads(m.group(0)) if m else []
+            parsed_curated: list = _parse_llm_json(raw_curated)
+            if not parsed_curated:
+                logger.warning("Curator returned empty output for user %s — skipping", public_user_ref(user.telegram_id))
         else:
             parsed_curated = raw_curated or []
         curated = _normalize_articles(parsed_curated)
+        curated = validate_curated_articles(curated, valid_ids, prefs.get("topics", []))
+        logger.info("Curated articles after validation: %d for user %s", len(curated), _user_ref)
         weighted = _weighted_topic_selection(
             curated, prefs.get("topic_weights", {}), total_slots=settings.DIGEST_MAX_ARTICLES
         )
@@ -262,12 +293,12 @@ async def process_user(user: User) -> None:
             "Weighted selection: %d curated → %d selected for user %s",
             len(curated),
             len(weighted),
-            user.telegram_id,
+            public_user_ref(user.telegram_id),
         )
 
         # 5. Summariser pass — weighted subset injected via state_delta (ADK-native, persists to session)
         async for _ in summariser_runner.run_async(
-            user_id=user.telegram_id,
+            user_id=_user_ref,
             session_id=session.id,
             new_message=trigger,
             state_delta={"curated_articles": json.dumps(weighted)},
@@ -277,33 +308,29 @@ async def process_user(user: User) -> None:
         # 6. Read final_digest from session state
         state = await session_service.get_session(
             app_name="news_bot",
-            user_id=user.telegram_id,
+            user_id=_user_ref,
             session_id=session.id,
         )
-        logger.info("session state keys: %s", list(state.state.keys()))
+        logger.info("session state keys for user %s: %s", _user_ref, list(state.state.keys()))
         raw = state.state.get("final_digest", "[]")
         if isinstance(raw, str):
-            raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
-            raw = re.sub(r"\s*```$", "", raw.strip())
-            try:
-                json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                m = re.search(r"\[[\s\S]*\]", raw)
-                if m:
-                    raw = m.group(0)
-        final_digest_json: str = raw if isinstance(raw, str) else json.dumps(raw)
+            parsed_final = _parse_llm_json(raw)
+        else:
+            parsed_final = raw if isinstance(raw, list) else []
+        final_digest_json: str = json.dumps(parsed_final)
 
-        # Final hard cap — guards against the LLM expanding input beyond the weighted subset
-        try:
-            _cap_articles = _normalize_articles(json.loads(final_digest_json))
-            if len(_cap_articles) > settings.DIGEST_MAX_ARTICLES:
-                logger.info(
-                    "Final digest capped: %d → %d for user %s",
-                    len(_cap_articles), settings.DIGEST_MAX_ARTICLES, user.telegram_id,
-                )
-                final_digest_json = json.dumps(_cap_articles[:settings.DIGEST_MAX_ARTICLES])
-        except (json.JSONDecodeError, TypeError):
-            pass
+        # Validate summariser output against source of truth, then cap
+        logger.info("parsed_final before guardrails: %d articles for user %s", len(_normalize_articles(parsed_final)), _user_ref)
+        _validated = validate_final_digest(
+            _normalize_articles(parsed_final), valid_ids, prefs.get("topics", []), raw_articles_by_id
+        )
+        if len(_validated) > settings.DIGEST_MAX_ARTICLES:
+            logger.info(
+                "Final digest capped: %d → %d for user %s",
+                len(_validated), settings.DIGEST_MAX_ARTICLES, public_user_ref(user.telegram_id),
+            )
+            _validated = _validated[:settings.DIGEST_MAX_ARTICLES]
+        final_digest_json = json.dumps(_validated)
 
         # 7. Inject real URLs, images, and dates from session state
         url_map: dict[str, str] = dict(state.state.get("url_map") or {})
@@ -319,11 +346,11 @@ async def process_user(user: User) -> None:
                     image_map,
                     citation_status_map,
                     published_at_map,
-                    user.telegram_id,
+                    public_user_ref(user.telegram_id),
                 )
                 final_digest_json = json.dumps(articles)
                 injected = sum(1 for a in articles if a.get("url"))
-                logger.info("Injected %d real URLs for user %s", injected, user.telegram_id)
+                logger.info("Injected %d real URLs for user %s", injected, public_user_ref(user.telegram_id))
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -335,16 +362,25 @@ async def process_user(user: User) -> None:
         except (json.JSONDecodeError, TypeError):
             pass
 
-        logger.info("final_digest for user %s: %s", user.telegram_id, final_digest_json[:500])
+        try:
+            _article_count = len(_normalize_articles(json.loads(final_digest_json)))
+        except (json.JSONDecodeError, TypeError):
+            _article_count = 0
+        logger.info(
+            "final_digest for user %s: %d articles, %d bytes",
+            public_user_ref(user.telegram_id),
+            _article_count,
+            len(final_digest_json),
+        )
         await send_digest_message(user.telegram_id, final_digest_json)
         await db.update_user(
             user.telegram_id,
             last_digest_sent=datetime.utcnow(),
             total_digests_sent=user.total_digests_sent + 1,
         )
-        logger.info("Digest delivered to user %s", user.telegram_id)
+        logger.info("Digest delivered to user %s", public_user_ref(user.telegram_id))
     except Exception as exc:
-        logger.error("process_user(%s) failed: %s", user.telegram_id, exc, exc_info=True)
+        logger.error("process_user(%s) failed: %s", public_user_ref(user.telegram_id), exc, exc_info=True)
         try:
             await send_error_to_user(
                 user.telegram_id,
@@ -352,7 +388,7 @@ async def process_user(user: User) -> None:
             )
         except Exception as notify_exc:
             logger.error(
-                "Failed to notify user %s of error: %s", user.telegram_id, notify_exc
+                "Failed to notify user %s of error: %s", public_user_ref(user.telegram_id), notify_exc
             )
         raise
 

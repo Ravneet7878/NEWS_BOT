@@ -9,7 +9,9 @@ from telegram.ext import ContextTypes
 import shared.database as db
 from shared.config import settings
 from shared.models import OnboardingState
+from utils.guardrails import is_unsafe_content
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -103,6 +105,16 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await update.message.reply_text("Usage: /broadcast <message>")
             return
 
+        if len(message_text) > settings.MAX_BROADCAST_LENGTH:
+            await update.message.reply_text(
+                f"Message too long (max {settings.MAX_BROADCAST_LENGTH} characters)."
+            )
+            return
+
+        if is_unsafe_content(message_text):
+            await update.message.reply_text("Broadcast message contains disallowed content.")
+            return
+
         users = await db.get_all_active_users()
         if not users:
             await update.message.reply_text("No active users to broadcast to.")
@@ -118,7 +130,7 @@ async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 sent += 1
             except Exception as send_exc:
                 logger.warning(
-                    "Broadcast failed for user %s: %s", user.telegram_id, send_exc
+                    "Broadcast failed for user %s: %s", public_user_ref(user.telegram_id), send_exc
                 )
                 failed += 1
             # Respect Telegram rate limits

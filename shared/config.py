@@ -37,6 +37,14 @@ class Settings(BaseSettings):
     DIGEST_MAX_ARTICLES: int = 7
     MAX_TOPICS: int = 7
 
+    # Privacy & guardrails
+    LOG_PSEUDONYM_SALT: str = ""   # HMAC key for log pseudonymization; required in non-local envs
+    MAX_TOPIC_LENGTH: int = 40
+    MAX_BROADCAST_LENGTH: int = 4000  # Telegram hard limit is 4096
+
+    # Deployment environment: "local" or "test" disables the salt requirement
+    APP_ENV: str = "local"
+
     # ADK backend selection — set to "1" locally to use Vertex AI instead of Gemini API
     GOOGLE_GENAI_USE_VERTEXAI: str = ""
     GOOGLE_CLOUD_PROJECT: str = ""
@@ -58,6 +66,12 @@ class Settings(BaseSettings):
             os.environ["GOOGLE_CLOUD_PROJECT"] = self.GOOGLE_CLOUD_PROJECT
         if self.GOOGLE_CLOUD_LOCATION:
             os.environ["GOOGLE_CLOUD_LOCATION"] = self.GOOGLE_CLOUD_LOCATION
+
+        if self.APP_ENV not in ("local", "test") and not self.LOG_PSEUDONYM_SALT:
+            raise ValueError(
+                "LOG_PSEUDONYM_SALT must be set in non-local environments. "
+                "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+            )
 
 
 @lru_cache(maxsize=1)

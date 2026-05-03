@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 import shared.database as db
 from shared.models import Feedback
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,17 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Unknown feedback type.")
             return
 
+        # Verify the topic belongs to this user before adjusting weights
+        user = await db.get_user(telegram_id)
+        if user is None or topic not in (user.topics or []):
+            logger.warning(
+                "Feedback for unknown topic %r from user %s — ignoring",
+                topic,
+                public_user_ref(telegram_id),
+            )
+            await query.answer()
+            return
+
         delta = 0.1 if feedback_type == "more" else -0.1
 
         await db.update_topic_weights(telegram_id, topic, delta)
@@ -53,7 +65,7 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await query.answer("Got it! Adjusting your feed.")
     except Exception as exc:
-        logger.error("handle_feedback(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_feedback(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         try:
             await query.answer("Something went wrong. Please try again.")
         except Exception:

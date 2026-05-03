@@ -9,7 +9,9 @@ from telegram.ext import ContextTypes
 import shared.database as db
 from api.handlers.onboarding import _parse_hour, _local_to_utc_hour
 from shared.config import settings
+from utils.guardrails import sanitize_topics
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -43,7 +45,7 @@ async def handle_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Digest delivery paused. Send /resume whenever you want to start again."
         )
     except Exception as exc:
-        logger.error("handle_pause(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_pause(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -59,7 +61,7 @@ async def handle_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await db.update_user(telegram_id, is_paused=False)
         await update.message.reply_text("Digest delivery resumed. ✅")
     except Exception as exc:
-        logger.error("handle_resume(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_resume(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -87,9 +89,11 @@ async def handle_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
 
-        new_topics = list(dict.fromkeys(t.strip() for t in raw.split(",") if t.strip()))
-        if not 1 <= len(new_topics) <= settings.MAX_TOPICS:
-            await update.message.reply_text(f"Please provide between 1 and {settings.MAX_TOPICS} topics.")
+        raw_split = [t.strip() for t in raw.split(",")]
+        try:
+            new_topics = sanitize_topics(raw_split)
+        except ValueError as policy_err:
+            await update.message.reply_text(str(policy_err))
             return
 
         # Preserve existing weights where the topic name matches
@@ -100,7 +104,7 @@ async def handle_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         topics_display = ", ".join(new_topics)
         await update.message.reply_text(f"Topics updated: {topics_display}")
     except Exception as exc:
-        logger.error("handle_topics(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_topics(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -139,7 +143,7 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"Delivery time updated to {local_hour:02d}:00 {tz_name} (UTC {utc_hour:02d}:00). ✅"
         )
     except Exception as exc:
-        logger.error("handle_time(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_time(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -192,7 +196,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Topics:\n{topics_display}"
         )
     except Exception as exc:
-        logger.error("handle_status(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_status(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -210,7 +214,7 @@ async def handle_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Send /confirmdelete to proceed, or ignore this message to cancel."
         )
     except Exception as exc:
-        logger.error("handle_delete(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_delete(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 
@@ -229,7 +233,7 @@ async def handle_confirmdelete(update: Update, context: ContextTypes.DEFAULT_TYP
             "If you ever want to return, you'll need a new invite code."
         )
     except Exception as exc:
-        logger.error("handle_confirmdelete(%s) failed: %s", telegram_id, exc, exc_info=True)
+        logger.error("handle_confirmdelete(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
         await update.message.reply_text("Something went wrong. Please try again.")
 
 

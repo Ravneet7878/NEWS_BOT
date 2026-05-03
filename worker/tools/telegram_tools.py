@@ -8,6 +8,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
 from shared.config import settings
 from utils.logging import get_logger
+from utils.privacy import public_user_ref
 
 logger = get_logger(__name__)
 
@@ -190,7 +191,7 @@ async def send_digest_message(telegram_id: str, digest_text: str) -> dict:
         return {"status": "delivered", "messages_sent": messages_sent}
     except Exception as exc:
         logger.error(
-            "send_digest_message(%s) failed: %s", telegram_id, exc, exc_info=True
+            "send_digest_message(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True
         )
         return {"error": str(exc)}
 
@@ -206,6 +207,6 @@ async def send_error_to_user(telegram_id: str, error_message: str) -> dict:
         return {"status": "sent"}
     except Exception as exc:
         logger.error(
-            "send_error_to_user(%s) failed: %s", telegram_id, exc, exc_info=True
+            "send_error_to_user(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True
         )
         return {"error": str(exc)}

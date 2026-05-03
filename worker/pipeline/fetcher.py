@@ -2,6 +2,7 @@
 
 import json
 
+from utils.guardrails import validate_topic_policy
 from utils.logging import get_logger
 from worker.tools.search_tools import search_news
 
@@ -40,6 +41,12 @@ async def fetch_articles_for_user(prefs: dict, state: dict) -> None:
     all_articles: list[dict] = []
 
     for topic in sorted_topics:
+        try:
+            validate_topic_policy(topic)
+        except ValueError:
+            logger.warning("Fetcher: skipping stored topic that failed policy check: %r", topic)
+            continue
+
         query = f"{topic} latest news"
         logger.info("Fetcher: topic=%r q=%r", topic, query)
         articles: list[dict] = json.loads(await search_news(query, ctx))
