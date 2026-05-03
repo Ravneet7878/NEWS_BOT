@@ -1,12 +1,9 @@
 """PTB CallbackQueryHandler for 👍/👎 inline feedback buttons."""
 
-from datetime import date, datetime
-
 from telegram import Update
 from telegram.ext import ContextTypes
 
 import shared.database as db
-from shared.models import Feedback
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
 
@@ -32,7 +29,7 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await query.answer("Unknown action.")
             return
 
-        _, feedback_type, topic, article_title = parts
+        _, feedback_type, topic, short_id = parts
 
         if feedback_type not in ("more", "less"):
             await query.answer("Unknown feedback type.")
@@ -52,16 +49,7 @@ async def handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         delta = 0.1 if feedback_type == "more" else -0.1
 
         await db.update_topic_weights(telegram_id, topic, delta)
-        await db.save_feedback(
-            Feedback(
-                user_id=telegram_id,
-                topic=topic,
-                article_title=article_title,
-                feedback_type=feedback_type,
-                created_at=datetime.utcnow(),
-                digest_date=date.today(),
-            )
-        )
+        await db.record_article_reaction(telegram_id, topic, short_id, feedback_type)
 
         await query.answer("Got it! Adjusting your feed.")
     except Exception as exc:

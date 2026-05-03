@@ -1,12 +1,12 @@
 """Async Firestore helper functions — module-level singleton, no wrapper classes."""
 
-from datetime import datetime
+from datetime import date, datetime, timedelta, timezone
 
 from google.cloud.firestore_v1 import FieldFilter  # type: ignore[import-untyped]
 from google.cloud.firestore_v1.async_client import AsyncClient  # type: ignore[import-untyped]
 
 from shared.config import settings
-from shared.models import Feedback, InviteCode, OnboardingState, User
+from shared.models import InviteCode, OnboardingState, User
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
 
@@ -17,7 +17,8 @@ _db: AsyncClient = AsyncClient(project=settings.GCP_PROJECT_ID)
 
 _USERS_COL = "users"
 _INVITE_CODES_COL = "invite_codes"
-_FEEDBACK_COL = "feedback"
+_DIGEST_HISTORY_COL = "user_digest_history"
+_PENDING_COL = "pending_digests"
 
 
 # ---------------------------------------------------------------------------
@@ -144,17 +145,8 @@ async def get_active_users_for_hour(utc_hour: int) -> list[User]:
 
 
 # ---------------------------------------------------------------------------
-# Feedback
+# Topic weights (learning signal)
 # ---------------------------------------------------------------------------
-
-
-async def save_feedback(feedback: Feedback) -> None:
-    """Append a feedback record to the feedback collection."""
-    try:
-        await _db.collection(_FEEDBACK_COL).add(feedback.model_dump(mode="json"))
-    except Exception as exc:
-        logger.error("save_feedback failed: %s", exc, exc_info=True)
-        raise
 
 
 async def update_topic_weights(
@@ -190,6 +182,200 @@ async def update_topic_weights(
             "update_topic_weights(%s, %s) failed: %s", public_user_ref(telegram_id), topic, exc, exc_info=True
         )
         raise
+
+
+# ---------------------------------------------------------------------------
+# Digest history (per-user-per-day, with reaction tracking)
+# ---------------------------------------------------------------------------
+
+
+def _digest_history_doc_id(telegram_id: str, sent_date: date) -> str:
+    """Composite ID = `{public_user_ref}_{YYYY-MM-DD}` for O(1) per-day lookups."""
+    return f"{public_user_ref(telegram_id)}_{sent_date.isoformat()}"
+
+
+async def save_user_digest_history(
+    telegram_id: str, articles: list[dict], sent_at: datetime
+) -> None:
+    """Persist what was delivered to a user on a given UTC day.
+
+    Idempotent: same-day re-runs overwrite the existing doc.
+    Failure is logged and swallowed so a history write can't block delivery.
+    """
+    try:
+        sent_date = sent_at.date()
+        doc_id = _digest_history_doc_id(telegram_id, sent_date)
+        ttl = settings.DIGEST_HISTORY_TTL_SECONDS
+        expires_at = sent_at + timedelta(seconds=ttl)
+        # Strip any prior reaction state — fresh delivery means fresh reactions
+        clean_articles = [
+            {
+                "article_id": a.get("article_id", ""),
+                "url": a.get("url", ""),
+                "title": a.get("title", ""),
+                "topic": a.get("topic", ""),
+                "source": a.get("source", ""),
+                "published_at": a.get("published_at", ""),
+                "citation_status": a.get("citation_status", "valid"),
+                "reaction": None,
+                "reacted_at": None,
+            }
+            for a in articles
+        ]
+        payload = {
+            "user_ref": public_user_ref(telegram_id),
+            "date": sent_date.isoformat(),
+            "sent_at": sent_at,
+            "expires_at": expires_at,
+            "articles": clean_articles,
+        }
+        await _db.collection(_DIGEST_HISTORY_COL).document(doc_id).set(payload)
+    except Exception as exc:
+        logger.error(
+            "save_user_digest_history(%s) failed: %s",
+            public_user_ref(telegram_id),
+            exc,
+            exc_info=True,
+        )
+
+
+async def record_article_reaction(
+    telegram_id: str, topic: str, article_id_prefix: str, feedback_type: str
+) -> None:
+    """Patch the matching article in today's (or yesterday's) history doc.
+
+    Looks for the article by article_id prefix (first 8 chars of UUID). If neither
+    today nor yesterday contains a match (TTL expired or stale callback), logs and
+    exits silently. Never raises — topic-weights have already been updated by the caller.
+    """
+    try:
+        now = datetime.now(timezone.utc)
+        candidates = [now.date(), (now - timedelta(days=1)).date()]
+        for day in candidates:
+            doc_id = _digest_history_doc_id(telegram_id, day)
+            doc_ref = _db.collection(_DIGEST_HISTORY_COL).document(doc_id)
+            doc = await doc_ref.get()
+            if not doc.exists:
+                continue
+            data = doc.to_dict() or {}
+            articles = list(data.get("articles") or [])
+            patched = False
+            for a in articles:
+                if a.get("article_id", "").startswith(article_id_prefix):
+                    a["reaction"] = feedback_type
+                    a["reacted_at"] = now
+                    patched = True
+                    break
+            if patched:
+                await doc_ref.update({"articles": articles})
+                return
+
+        logger.info(
+            "record_article_reaction: no matching article for user=%s topic=%r article_id_prefix=%r in last 2 days",
+            public_user_ref(telegram_id),
+            topic,
+            article_id_prefix,
+        )
+    except Exception as exc:
+        logger.error(
+            "record_article_reaction(%s) failed: %s",
+            public_user_ref(telegram_id),
+            exc,
+            exc_info=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Pending digests (pre-built by /prepare, consumed by /deliver)
+# ---------------------------------------------------------------------------
+
+
+def _pending_doc_id(telegram_id: str, target_date: date, target_hour: int) -> str:
+    return f"{public_user_ref(telegram_id)}_{target_date.isoformat()}_{target_hour:02d}"
+
+
+async def save_pending_digest(
+    telegram_id: str,
+    target_date: date,
+    target_hour: int,
+    articles: list[dict],
+) -> None:
+    """Persist a fully-built digest ready for Telegram delivery. Overwrites any existing doc."""
+    try:
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(seconds=settings.PENDING_DIGEST_TTL_SECONDS)
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        payload = {
+            "telegram_id": telegram_id,
+            "target_hour": target_hour,
+            "target_date": target_date.isoformat(),
+            "articles": articles,
+            "built_at": now,
+            "delivered_at": None,
+            "expires_at": expires_at,
+        }
+        await _db.collection(_PENDING_COL).document(doc_id).set(payload)
+    except Exception as exc:
+        logger.error(
+            "save_pending_digest(%s) failed: %s",
+            public_user_ref(telegram_id),
+            exc,
+            exc_info=True,
+        )
+        raise
+
+
+async def get_pending_digest(
+    telegram_id: str,
+    target_date: date,
+    target_hour: int,
+) -> dict | None:
+    """Return a pending digest doc if present and unexpired, else None."""
+    try:
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        doc = await _db.collection(_PENDING_COL).document(doc_id).get()
+        if not doc.exists:
+            return None
+        data = doc.to_dict() or {}
+        expires_at = data.get("expires_at")
+        now = datetime.now(timezone.utc)
+        if expires_at is not None:
+            if isinstance(expires_at, datetime):
+                exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+            else:
+                seconds = getattr(expires_at, "seconds", None)
+                exp = datetime.fromtimestamp(seconds, tz=timezone.utc) if seconds else now
+            if exp <= now:
+                return None
+        return data
+    except Exception as exc:
+        logger.error(
+            "get_pending_digest(%s) failed: %s",
+            public_user_ref(telegram_id),
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+async def mark_pending_delivered(
+    telegram_id: str,
+    target_date: date,
+    target_hour: int,
+) -> None:
+    """Stamp delivered_at on the pending digest doc (does not delete it; TTL handles cleanup)."""
+    try:
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        await _db.collection(_PENDING_COL).document(doc_id).update(
+            {"delivered_at": datetime.now(timezone.utc)}
+        )
+    except Exception as exc:
+        logger.error(
+            "mark_pending_delivered(%s) failed: %s",
+            public_user_ref(telegram_id),
+            exc,
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------

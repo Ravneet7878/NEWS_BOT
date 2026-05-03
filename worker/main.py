@@ -1,10 +1,12 @@
 """Worker FastAPI service — Cloud Scheduler calls POST /run every hour."""
 
 import asyncio
+import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import httpx
 import vertexai  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException, Request
 from google.adk.runners import Runner  # type: ignore[import-untyped]
@@ -19,6 +21,8 @@ from utils.logging import get_logger, setup_logging
 from utils.privacy import public_user_ref
 from worker.pipeline.curator import curator_agent
 from worker.pipeline.fetcher import fetch_articles_for_user
+from worker.pipeline import llm_cache
+from worker.pipeline.prefetch import TopicResult, prefetch_topic_news
 from worker.pipeline.summariser import summariser_agent
 from worker.tools.firestore_tools import get_user_preferences
 from worker.tools.telegram_tools import send_digest_message, send_error_to_user
@@ -230,14 +234,86 @@ def _clean_digest_urls(articles: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-async def process_user(user: User) -> None:
+async def summarise_in_batches(weighted: list[dict], user_ref: str) -> list[dict]:
+    """Summarise articles in parallel batches, one LLM call per article within a batch.
+
+    Each batch creates a fresh ADK session so per-article summariser writes don't
+    race on the same `final_digest` key. Articles within a batch are summarised
+    sequentially (one article in the prompt at a time → no cross-article hallucination).
+    Batches run in parallel, capped by SUMMARISER_CONCURRENCY.
+    """
+    if not weighted:
+        return []
+
+    batch_size = max(1, settings.SUMMARISER_BATCH_SIZE)
+    batches: list[list[dict]] = [
+        weighted[i : i + batch_size] for i in range(0, len(weighted), batch_size)
+    ]
+    sem = asyncio.Semaphore(settings.SUMMARISER_CONCURRENCY)
+
+    async def _summarise_one(article: dict, batch_session_id: str) -> list[dict]:
+        async for _ in summariser_runner.run_async(
+            user_id=user_ref,
+            session_id=batch_session_id,
+            new_message=Content(role="user", parts=[Part(text=f"user_ref: {user_ref}")]),
+            state_delta={"curated_articles": json.dumps([article])},
+        ):
+            pass
+        live = await session_service.get_session(
+            app_name="news_bot",
+            user_id=user_ref,
+            session_id=batch_session_id,
+        )
+        raw = live.state.get("final_digest", "[]")
+        parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
+        return _normalize_articles(parsed)
+
+    async def _run_batch(batch: list[dict], idx: int) -> list[dict]:
+        async with sem:
+            try:
+                batch_session = await session_service.create_session(
+                    app_name="news_bot",
+                    user_id=user_ref,
+                    state={},
+                )
+                out: list[dict] = []
+                for article in batch:
+                    out.extend(await _summarise_one(article, batch_session.id))
+                return out
+            except Exception as exc:
+                logger.error(
+                    "summarise_in_batches: batch %d failed for user %s: %s",
+                    idx,
+                    user_ref,
+                    exc,
+                    exc_info=True,
+                )
+                return []
+
+    results = await asyncio.gather(
+        *[_run_batch(b, i) for i, b in enumerate(batches)]
+    )
+    merged: list[dict] = []
+    for r in results:
+        merged.extend(r)
+    logger.info(
+        "summarise_in_batches: user=%s batches=%d articles_in=%d articles_out=%d",
+        user_ref,
+        len(batches),
+        len(weighted),
+        len(merged),
+    )
+    return merged
+
+
+async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
     """Run the full pipeline for a single user and deliver the digest."""
     try:
         prefs = await get_user_preferences(user.telegram_id)
 
-        # 1. Deterministic fetch — Python controls every query string
+        # 1. Per-user assembly from prefetched topic data
         prefetch_state: dict = {"user_preferences": prefs}
-        await fetch_articles_for_user(prefs, prefetch_state)
+        await fetch_articles_for_user(prefs, prefetch_state, prefetched)
 
         # Build source-of-truth index from fetcher output (used by validation gates)
         raw_articles_list = _normalize_articles(
@@ -262,27 +338,36 @@ async def process_user(user: User) -> None:
         )
 
         # 3. Curator pass — scores and deduplicates raw_articles → curated_articles
-        async for _ in curator_runner.run_async(
-            user_id=_user_ref,
-            session_id=session.id,
-            new_message=trigger,
-        ):
-            pass
+        async def _run_curator() -> list:
+            async for _ in curator_runner.run_async(
+                user_id=_user_ref,
+                session_id=session.id,
+                new_message=trigger,
+            ):
+                pass
+            live = await session_service.get_session(
+                app_name="news_bot",
+                user_id=_user_ref,
+                session_id=session.id,
+            )
+            raw_curated = live.state.get("curated_articles", "[]")
+            if isinstance(raw_curated, str):
+                return _parse_llm_json(raw_curated)
+            return raw_curated or []
 
-        # 4. Weighted selection — limit curated_articles to per-topic slot quota
-        #    before summariser so we don't waste tokens on articles we'll drop
-        live = await session_service.get_session(
-            app_name="news_bot",
-            user_id=_user_ref,
-            session_id=session.id,
-        )
-        raw_curated = live.state.get("curated_articles", "[]")
-        if isinstance(raw_curated, str):
-            parsed_curated: list = _parse_llm_json(raw_curated)
-            if not parsed_curated:
-                logger.warning("Curator returned empty output for user %s — skipping", public_user_ref(user.telegram_id))
-        else:
-            parsed_curated = raw_curated or []
+        parsed_curated = await _run_curator()
+        # One retry if curator produced nothing despite non-empty raw_articles
+        if not parsed_curated and raw_articles_list:
+            logger.warning(
+                "Curator returned empty output for user %s — retrying once",
+                public_user_ref(user.telegram_id),
+            )
+            parsed_curated = await _run_curator()
+        if not parsed_curated:
+            logger.warning(
+                "Curator still empty after retry for user %s — proceeding with no curated articles",
+                public_user_ref(user.telegram_id),
+            )
         curated = _normalize_articles(parsed_curated)
         curated = validate_curated_articles(curated, valid_ids, prefs.get("topics", []))
         logger.info("Curated articles after validation: %d for user %s", len(curated), _user_ref)
@@ -296,27 +381,16 @@ async def process_user(user: User) -> None:
             public_user_ref(user.telegram_id),
         )
 
-        # 5. Summariser pass — weighted subset injected via state_delta (ADK-native, persists to session)
-        async for _ in summariser_runner.run_async(
-            user_id=_user_ref,
-            session_id=session.id,
-            new_message=trigger,
-            state_delta={"curated_articles": json.dumps(weighted)},
-        ):
-            pass
+        # 5. Batched parallel summarisation — 1 article per LLM call, batches run in parallel
+        parsed_final = await summarise_in_batches(weighted, _user_ref)
 
-        # 6. Read final_digest from session state
+        # 6. Re-read original session for url_map / image_map / etc
         state = await session_service.get_session(
             app_name="news_bot",
             user_id=_user_ref,
             session_id=session.id,
         )
         logger.info("session state keys for user %s: %s", _user_ref, list(state.state.keys()))
-        raw = state.state.get("final_digest", "[]")
-        if isinstance(raw, str):
-            parsed_final = _parse_llm_json(raw)
-        else:
-            parsed_final = raw if isinstance(raw, list) else []
         final_digest_json: str = json.dumps(parsed_final)
 
         # Validate summariser output against source of truth, then cap
@@ -373,11 +447,22 @@ async def process_user(user: User) -> None:
             len(final_digest_json),
         )
         await send_digest_message(user.telegram_id, final_digest_json)
+        sent_at = datetime.utcnow()
         await db.update_user(
             user.telegram_id,
-            last_digest_sent=datetime.utcnow(),
+            last_digest_sent=sent_at,
             total_digests_sent=user.total_digests_sent + 1,
         )
+        try:
+            delivered = _normalize_articles(json.loads(final_digest_json))
+            await db.save_user_digest_history(user.telegram_id, delivered, sent_at)
+        except Exception as hist_exc:
+            logger.error(
+                "save_user_digest_history(%s) failed: %s",
+                public_user_ref(user.telegram_id),
+                hist_exc,
+                exc_info=True,
+            )
         logger.info("Digest delivered to user %s", public_user_ref(user.telegram_id))
     except Exception as exc:
         logger.error("process_user(%s) failed: %s", public_user_ref(user.telegram_id), exc, exc_info=True)
@@ -394,8 +479,309 @@ async def process_user(user: User) -> None:
 
 
 # ---------------------------------------------------------------------------
+# /prepare helpers — topic-level curator + article-level summariser
+# ---------------------------------------------------------------------------
+
+
+async def run_curator_for_topic(topic: str, topic_result: TopicResult) -> list[dict]:
+    """Run the curator LLM once for a single topic. Returns curated articles with URLs injected."""
+    url_map: dict[str, str] = {}
+    image_map: dict[str, str] = {}
+    citation_status_map: dict[str, str] = {}
+    published_at_map: dict[str, str] = {}
+    raw_articles_list: list[dict] = []
+
+    for a in topic_result.raw_articles:
+        article_id = hashlib.sha256(a["link"].encode()).hexdigest()[:16]
+        url_map[article_id] = a["link"]
+        citation_status_map[article_id] = a["citation_status"]
+        published_at_map[article_id] = a["pub_date"]
+        if a["image_url"]:
+            image_map[article_id] = a["image_url"]
+        raw_articles_list.append({
+            "article_id": article_id,
+            "title": a["title"],
+            "source": a["source_name"],
+            "snippet": a["snippet"],
+            "published_at": a["pub_date"],
+            "topic": topic,
+            "url": "",
+            "summary": a["snippet"],
+        })
+
+    if not raw_articles_list:
+        return []
+
+    valid_ids = set(url_map.keys())
+    user_ref = f"prepare_{hashlib.sha256(topic.encode()).hexdigest()[:8]}"
+    session = await session_service.create_session(
+        app_name="news_bot",
+        user_id=user_ref,
+        state={"raw_articles": json.dumps(raw_articles_list)},
+    )
+
+    async def _run() -> list[dict]:
+        async for _ in curator_runner.run_async(
+            user_id=user_ref,
+            session_id=session.id,
+            new_message=Content(role="user", parts=[Part(text=f"user_ref: {user_ref}")]),
+        ):
+            pass
+        live = await session_service.get_session(
+            app_name="news_bot", user_id=user_ref, session_id=session.id
+        )
+        raw = live.state.get("curated_articles", "[]")
+        parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
+        return _normalize_articles(parsed)
+
+    curated = await _run()
+    if not curated and raw_articles_list:
+        logger.warning("run_curator_for_topic(%r): empty output — retrying once", topic)
+        curated = await _run()
+
+    curated = validate_curated_articles(curated, valid_ids, [topic])
+
+    # Inject real URLs, images, and dates back into the curated articles
+    for art in curated:
+        aid = art.get("article_id", "")
+        if url_map.get(aid):
+            art["url"] = url_map[aid]
+        if citation_status_map.get(aid):
+            art["citation_status"] = citation_status_map[aid]
+        if image_map.get(aid):
+            art["image_url"] = image_map[aid]
+        if published_at_map.get(aid) and not art.get("published_at"):
+            art["published_at"] = published_at_map[aid]
+
+    # Drop articles whose URLs didn't survive injection
+    curated = [a for a in curated if _is_safe_article_url(a.get("url", ""))]
+
+    logger.info("run_curator_for_topic(%r): %d articles after curation", topic, len(curated))
+    return curated
+
+
+async def run_summariser_for_article(art: dict) -> dict:
+    """Run the summariser LLM for a single article. Returns the summary dict."""
+    user_ref = "prepare_summarise"
+    session = await session_service.create_session(
+        app_name="news_bot",
+        user_id=user_ref,
+        state={},
+    )
+    async for _ in summariser_runner.run_async(
+        user_id=user_ref,
+        session_id=session.id,
+        new_message=Content(role="user", parts=[Part(text=f"user_ref: {user_ref}")]),
+        state_delta={"curated_articles": json.dumps([art])},
+    ):
+        pass
+    live = await session_service.get_session(
+        app_name="news_bot", user_id=user_ref, session_id=session.id
+    )
+    raw = live.state.get("final_digest", "[]")
+    parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
+    results = _normalize_articles(parsed)
+    return results[0] if results else {}
+
+
+def _flatten_curated_for_user(
+    curated_by_topic: dict[str, list[dict]],
+    topics: list[str] | None,
+) -> list[dict]:
+    """Merge curated articles from the user's topics into a single flat list."""
+    result: list[dict] = []
+    seen_urls: set[str] = set()
+    for topic in (topics or []):
+        for art in curated_by_topic.get(topic, []):
+            url = art.get("url", "")
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            result.append(art)
+    return result
+
+
+def _dedup_articles_by_url(
+    per_user_selections: dict[str, list[dict]],
+) -> list[dict]:
+    """Return one article per unique URL across all users' selections."""
+    seen: dict[str, dict] = {}
+    for articles in per_user_selections.values():
+        for art in articles:
+            url = art.get("url", "")
+            if url and url not in seen:
+                seen[url] = art
+    return list(seen.values())
+
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+
+@app.post("/prepare")
+async def prepare_digests(request: Request) -> dict:
+    """Pre-build digests 5 minutes before the delivery hour.
+
+    Runs curator once per unique topic and summariser once per unique article URL,
+    using Firestore caches to skip repeated LLM calls. Stores results in pending_digests
+    so /deliver can send them without any LLM work.
+    """
+    now = datetime.utcnow()
+    target_hour = (now.hour + 1) % 24
+    target_date = (now + timedelta(minutes=10)).date()
+
+    try:
+        users = await db.get_active_users_for_hour(target_hour)
+    except Exception as exc:
+        logger.error("prepare_digests: failed to fetch users: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+    if not users:
+        logger.info("prepare_digests: no users for UTC hour %d", target_hour)
+        return {"prepared": 0}
+
+    unique_topics: set[str] = {t for u in users for t in (u.topics or [])}
+    logger.info(
+        "prepare_digests: %d users, %d unique topics, target_hour=%d",
+        len(users), len(unique_topics), target_hour,
+    )
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+        follow_redirects=True,
+    ) as client:
+        prefetched = await prefetch_topic_news(unique_topics, client)
+
+    # Step 1: curator — once per topic, sequential, Firestore-cached
+    curated_by_topic: dict[str, list[dict]] = {}
+    for topic in unique_topics:
+        hit = await llm_cache.get_cached_curated_topic(topic)
+        if hit is not None:
+            curated_by_topic[topic] = hit
+        else:
+            topic_result = prefetched.get(topic)
+            if topic_result is None:
+                logger.warning("prepare_digests: no prefetch result for topic=%r", topic)
+                curated_by_topic[topic] = []
+                continue
+            curated = await run_curator_for_topic(topic, topic_result)
+            await llm_cache.set_cached_curated_topic(topic, curated)
+            curated_by_topic[topic] = curated
+
+    # Step 2: per-user weighted selection (pure Python, no LLM)
+    per_user_selections: dict[str, list[dict]] = {}
+    for user in users:
+        articles = _flatten_curated_for_user(curated_by_topic, user.topics)
+        selected = _weighted_topic_selection(articles, user.topic_weights or {})
+        per_user_selections[user.telegram_id] = selected
+
+    # Step 3: summariser — once per unique URL, sequential, Firestore-cached
+    unique_articles = _dedup_articles_by_url(per_user_selections)
+    summary_by_url: dict[str, dict] = {}
+    for art in unique_articles:
+        url = art.get("url", "")
+        if not url:
+            continue
+        hit = await llm_cache.get_cached_article_summary(url)
+        if hit is not None:
+            summary_by_url[url] = hit
+        else:
+            summary = await run_summariser_for_article(art)
+            if summary:
+                await llm_cache.set_cached_article_summary(url, summary)
+                summary_by_url[url] = summary
+
+    # Step 4: assemble and store pending digest per user
+    for user in users:
+        digest_articles = [
+            {**art, **summary_by_url[art["url"]]}
+            for art in per_user_selections[user.telegram_id]
+            if art.get("url") in summary_by_url
+        ]
+        digest_articles = _filter_deliverable_articles(digest_articles)
+        try:
+            await db.save_pending_digest(
+                user.telegram_id, target_date, target_hour, digest_articles
+            )
+        except Exception as exc:
+            logger.error(
+                "prepare_digests: save_pending_digest failed for %s: %s",
+                public_user_ref(user.telegram_id), exc, exc_info=True,
+            )
+
+    logger.info(
+        "prepare_digests complete: prepared=%d topics=%d unique_articles=%d",
+        len(users), len(unique_topics), len(unique_articles),
+    )
+    return {
+        "prepared": len(users),
+        "topics": len(unique_topics),
+        "unique_articles_summarised": len(unique_articles),
+    }
+
+
+@app.post("/deliver")
+async def deliver_digests(request: Request) -> dict:
+    """Deliver pre-built digests from pending_digests. No LLM calls.
+
+    Falls back to the legacy live pipeline (/run logic) if /prepare didn't run.
+    """
+    now = datetime.utcnow()
+    target_hour = now.hour
+    target_date = now.date()
+
+    try:
+        users = await db.get_active_users_for_hour(target_hour)
+    except Exception as exc:
+        logger.error("deliver_digests: failed to fetch users: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch users")
+
+    if not users:
+        logger.info("deliver_digests: no users for UTC hour %d", target_hour)
+        return {"delivered": 0}
+
+    sem = asyncio.Semaphore(settings.USER_PROCESS_CONCURRENCY)
+
+    async def _deliver_one(user: User) -> None:
+        async with sem:
+            pending = await db.get_pending_digest(user.telegram_id, target_date, target_hour)
+            if pending is None:
+                logger.warning(
+                    "deliver_digests: no pending digest for %s — falling back to live pipeline",
+                    public_user_ref(user.telegram_id),
+                )
+                await process_user(user, prefetched={})
+                return
+
+            articles_json = json.dumps(pending.get("articles", []))
+            await send_digest_message(user.telegram_id, articles_json)
+            sent_at = datetime.utcnow()
+            try:
+                await db.save_user_digest_history(
+                    user.telegram_id, pending.get("articles", []), sent_at
+                )
+            except Exception as hist_exc:
+                logger.error(
+                    "deliver_digests: save_user_digest_history(%s) failed: %s",
+                    public_user_ref(user.telegram_id), hist_exc, exc_info=True,
+                )
+            await db.update_user(
+                user.telegram_id,
+                last_digest_sent=sent_at,
+                total_digests_sent=user.total_digests_sent + 1,
+            )
+            await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
+            logger.info("deliver_digests: delivered to %s", public_user_ref(user.telegram_id))
+
+    results = await asyncio.gather(*[_deliver_one(u) for u in users], return_exceptions=True)
+    error_count = sum(1 for r in results if isinstance(r, BaseException))
+    logger.info(
+        "deliver_digests complete: delivered=%d errors=%d (UTC hour %d)",
+        len(users), error_count, target_hour,
+    )
+    return {"delivered": len(users), "errors": error_count}
 
 
 @app.post("/run")
@@ -415,9 +801,30 @@ async def run_digests(request: Request) -> dict:
         logger.info("No users scheduled for UTC hour %d", utc_hour)
         return {"users_processed": 0, "errors": 0}
 
-    results = await asyncio.gather(
-        *[process_user(u) for u in users], return_exceptions=True
+    unique_topics: set[str] = set()
+    for u in users:
+        unique_topics.update(u.topics or [])
+    logger.info(
+        "Run starting: %d users, %d unique topics (UTC hour %d)",
+        len(users),
+        len(unique_topics),
+        utc_hour,
     )
+
+    sem = asyncio.Semaphore(settings.USER_PROCESS_CONCURRENCY)
+
+    async def _bounded(user: User, prefetched: dict[str, TopicResult]) -> None:
+        async with sem:
+            await process_user(user, prefetched)
+
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"},
+        follow_redirects=True,
+    ) as client:
+        prefetched = await prefetch_topic_news(unique_topics, client)
+        results = await asyncio.gather(
+            *[_bounded(u, prefetched) for u in users], return_exceptions=True
+        )
 
     error_count = sum(1 for r in results if isinstance(r, BaseException))
     logger.info(

@@ -1,6 +1,6 @@
 """Pydantic data models shared across the api and worker services."""
 
-from datetime import date, datetime
+from datetime import datetime
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -37,12 +37,3 @@ class InviteCode(BaseModel):
     used_at: datetime | None = None
     created_at: datetime
     expires_at: datetime | None = None
-
-
-class Feedback(BaseModel):
-    user_id: str
-    topic: str
-    article_title: str
-    feedback_type: str  # "more" | "less"
-    created_at: datetime
-    digest_date: date

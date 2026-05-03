@@ -1,29 +1,27 @@
-"""Deterministic news fetcher — queries built from configured topics only."""
+"""Per-user article assembly from prefetched topic data."""
 
 import json
 
-from utils.guardrails import validate_topic_policy
 from utils.logging import get_logger
-from worker.tools.search_tools import search_news
+from worker.pipeline.prefetch import TopicResult
+from worker.tools.search_tools import assemble_articles_for_topic
 
 logger = get_logger(__name__)
 
 
-class _StateProxy:
-    """Minimal shim so search_news can write to a plain dict via tool_context.state."""
+async def fetch_articles_for_user(
+    prefs: dict,
+    state: dict,
+    prefetched: dict[str, TopicResult],
+) -> None:
+    """Assemble per-user raw_articles from prefetched topic results.
 
-    def __init__(self, state: dict) -> None:
-        self.state = state
-
-
-async def fetch_articles_for_user(prefs: dict, state: dict) -> None:
-    """
-    Deterministically fetch articles for all configured topics.
-
-    Reads:  prefs["topics"] and prefs["topic_weights"]
-    Writes: state["raw_articles"] (JSON string)
-            state["url_map"], state["image_map"],
+    Reads:  prefs["topics"], prefs["topic_weights"], prefetched
+    Writes: state["raw_articles"], state["url_map"], state["image_map"],
             state["citation_status_map"], state["published_at_map"]
+
+    Cross-topic URL dedup: if a URL appears in multiple topics, it's assigned
+    to the user's highest-weighted matching topic.
     """
     topics: list[str] = prefs.get("topics", [])
     weights: dict[str, float] = prefs.get("topic_weights", {})
@@ -37,43 +35,33 @@ async def fetch_articles_for_user(prefs: dict, state: dict) -> None:
 
     topic_set = set(topics)
     sorted_topics = sorted(topics, key=lambda t: weights.get(t, 1.0), reverse=True)
-    ctx = _StateProxy(state)
+
+    seen_links: set[str] = set()
     all_articles: list[dict] = []
 
     for topic in sorted_topics:
-        try:
-            validate_topic_policy(topic)
-        except ValueError:
-            logger.warning("Fetcher: skipping stored topic that failed policy check: %r", topic)
+        result = prefetched.get(topic)
+        if result is None:
+            logger.warning("Fetcher: no prefetched result for topic=%r", topic)
             continue
 
-        query = f"{topic} latest news"
-        logger.info("Fetcher: topic=%r q=%r", topic, query)
-        articles: list[dict] = json.loads(await search_news(query, ctx))
+        # Dedup by URL across topics — first (highest-weight) topic wins
+        unique = TopicResult(
+            topic=topic,
+            raw_articles=[a for a in result.raw_articles if a["link"] not in seen_links],
+        )
+        for a in unique.raw_articles:
+            seen_links.add(a["link"])
 
-        if len(articles) < 3:
-            fallback = f"{topic} trending news"
-            logger.info(
-                "Fetcher: topic=%r only %d articles, fallback q=%r",
-                topic,
-                len(articles),
-                fallback,
-            )
-            existing_ids = {a["article_id"] for a in articles}
-            for a in json.loads(await search_news(fallback, ctx)):
-                if a["article_id"] not in existing_ids:
-                    articles.append(a)
-                    existing_ids.add(a["article_id"])
-
+        articles = assemble_articles_for_topic(topic, unique, state)
         for a in articles:
-            a["topic"] = topic  # deterministic — never LLM-assigned
+            a["topic"] = topic
             a["url"] = ""
             a["summary"] = a.get("snippet", "")
 
-        logger.info("Fetcher: topic=%r accepted %d articles", topic, len(articles))
+        logger.info("Fetcher: topic=%r assembled %d articles", topic, len(articles))
         all_articles.extend(articles)
 
-    # Belt-and-suspenders: drop any article whose topic isn't in the configured set
     validated = [a for a in all_articles if a.get("topic") in topic_set]
     dropped = len(all_articles) - len(validated)
     if dropped:

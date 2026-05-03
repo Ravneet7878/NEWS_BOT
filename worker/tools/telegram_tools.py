@@ -5,6 +5,13 @@ import json
 import re
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import NetworkError, RetryAfter, TimedOut
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from shared.config import settings
 from utils.logging import get_logger
@@ -17,6 +24,18 @@ _bot: Bot = Bot(token=settings.TELEGRAM_BOT_TOKEN)
 
 _MAX_MESSAGE_LENGTH = 4096
 _CALLBACK_MAX = 64  # Telegram hard limit on callback_data bytes
+
+
+@retry(
+    stop=stop_after_attempt(settings.RETRY_MAX_ATTEMPTS),
+    wait=wait_random_exponential(
+        multiplier=settings.RETRY_BACKOFF_BASE_SECONDS, max=10.0
+    ),
+    retry=retry_if_exception_type((TimedOut, NetworkError, RetryAfter)),
+    reraise=True,
+)
+async def _send_with_retry(**kwargs: object) -> object:
+    return await _bot.send_message(**kwargs)
 
 
 def _escape_with_bold(text: str) -> str:
@@ -34,25 +53,21 @@ def _byte_truncate(s: str, max_bytes: int) -> str:
     return enc[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _build_feedback_keyboard(topic: str, title: str) -> InlineKeyboardMarkup:
+def _build_feedback_keyboard(topic: str, article_id: str) -> InlineKeyboardMarkup:
     """Build the 👍/👎 inline keyboard for a single article."""
-    # Budget is in BYTES — Telegram enforces a 64-byte limit on callback_data.
-    # "feedback:more:" = 14 bytes; ":" separator = 1 byte → 49 bytes left for topic+title.
-    budget = _CALLBACK_MAX - 14 - 1
-    safe_topic = _byte_truncate(topic.replace(":", "-"), min(20, budget))
-    safe_title = _byte_truncate(
-        title.replace(":", "-"), budget - len(safe_topic.encode("utf-8"))
-    )
+    # Budget: 64 - "feedback:more:" (14) - ":" sep (1) - short_id (8) = 41 bytes for topic.
+    safe_topic = _byte_truncate(topic.replace(":", "-"), 41)
+    short_id = article_id[:8]
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     "👍 More like this",
-                    callback_data=f"feedback:more:{safe_topic}:{safe_title}",
+                    callback_data=f"feedback:more:{safe_topic}:{short_id}",
                 ),
                 InlineKeyboardButton(
                     "👎 Less like this",
-                    callback_data=f"feedback:less:{safe_topic}:{safe_title}",
+                    callback_data=f"feedback:less:{safe_topic}:{short_id}",
                 ),
             ]
         ]
@@ -178,9 +193,10 @@ async def send_digest_message(telegram_id: str, digest_text: str) -> dict:
             if len(body) > _MAX_MESSAGE_LENGTH:
                 body = body[: _MAX_MESSAGE_LENGTH - 1] + "…"
 
-            keyboard = _build_feedback_keyboard(topic, title) if title and topic else None
+            article_id: str = article.get("article_id", "")
+            keyboard = _build_feedback_keyboard(topic, article_id) if article_id and topic else None
 
-            await _bot.send_message(
+            await _send_with_retry(
                 chat_id=telegram_id,
                 text=body,
                 parse_mode="HTML",
@@ -203,7 +219,7 @@ async def send_error_to_user(telegram_id: str, error_message: str) -> dict:
     Returns: {"status": "sent"}
     """
     try:
-        await _bot.send_message(chat_id=telegram_id, text=error_message)
+        await _send_with_retry(chat_id=telegram_id, text=error_message)
         return {"status": "sent"}
     except Exception as exc:
         logger.error(

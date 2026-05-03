@@ -37,6 +37,29 @@ class Settings(BaseSettings):
     DIGEST_MAX_ARTICLES: int = 7
     MAX_TOPICS: int = 7
 
+    # News cache (Firestore-backed, cross-invocation)
+    NEWS_CACHE_TTL_SECONDS: int = 86400         # 24 hours
+    NEWS_CACHE_KEY_VERSION: str = "v1"
+    DIGEST_HISTORY_TTL_SECONDS: int = 604800    # 7 days
+
+    # LLM caches (cross-user, Firestore-backed)
+    CURATOR_VERSION: str = "v1"
+    SUMMARISER_VERSION: str = "v1"
+    CURATED_TOPIC_TTL_SECONDS: int = 3600       # 1 hour
+    ARTICLE_SUMMARY_TTL_SECONDS: int = 86400    # 24 hours
+    PENDING_DIGEST_TTL_SECONDS: int = 86400     # 24 hours
+
+    # Concurrency caps
+    NEWS_FETCH_CONCURRENCY: int = 5
+    CITATION_CHECK_CONCURRENCY: int = 10
+    USER_PROCESS_CONCURRENCY: int = 10
+    SUMMARISER_BATCH_SIZE: int = 3
+    SUMMARISER_CONCURRENCY: int = 3
+
+    # Retries
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_BACKOFF_BASE_SECONDS: float = 0.5
+
     # Privacy & guardrails
     LOG_PSEUDONYM_SALT: str = ""   # HMAC key for log pseudonymization; required in non-local envs
     MAX_TOPIC_LENGTH: int = 40
