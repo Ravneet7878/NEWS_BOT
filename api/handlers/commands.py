@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 import shared.database as db
 from api.handlers.onboarding import _parse_hour, _local_to_utc_hour
 from shared.config import settings
+from shared.models import OnboardingState
 from utils.guardrails import sanitize_topics
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
@@ -138,7 +139,15 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         local_hour, tz_name = parsed
         utc_hour = _local_to_utc_hour(local_hour, tz_name)
-        await db.update_user(telegram_id, delivery_hour_utc=utc_hour, delivery_tz=tz_name)
+
+        user = await db.get_user(telegram_id)
+        assert user is not None
+
+        extra: dict = {}
+        if not user.is_active and user.topics:
+            extra = {"is_active": True, "onboarding_state": OnboardingState.DONE}
+
+        await db.update_user(telegram_id, delivery_hour_utc=utc_hour, delivery_tz=tz_name, **extra)
         await update.message.reply_text(
             f"Delivery time updated to {local_hour:02d}:00 {tz_name} (UTC {utc_hour:02d}:00). ✅"
         )

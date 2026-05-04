@@ -11,7 +11,9 @@ import vertexai  # type: ignore[import-untyped]
 from fastapi import FastAPI, HTTPException, Request
 from google.adk.runners import Runner  # type: ignore[import-untyped]
 from google.adk.sessions import InMemorySessionService  # type: ignore[import-untyped]
+from google.api_core import exceptions as _gapi_exc  # type: ignore[import-untyped]
 from google.genai.types import Content, Part  # type: ignore[import-untyped]
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_random_exponential
 
 import shared.database as db
 from shared.config import settings
@@ -47,6 +49,43 @@ summariser_runner = Runner(
 )
 
 app = FastAPI(title="news-bot-worker")
+
+
+def _is_transient_llm_error(exc: BaseException) -> bool:
+    if isinstance(exc, (
+        _gapi_exc.ResourceExhausted,
+        _gapi_exc.ServiceUnavailable,
+        _gapi_exc.DeadlineExceeded,
+        _gapi_exc.InternalServerError,
+    )):
+        return True
+    try:
+        import grpc  # type: ignore[import-untyped]
+        if isinstance(exc, grpc.RpcError):
+            return exc.code() in (  # type: ignore[union-attr]
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                grpc.StatusCode.UNAVAILABLE,
+                grpc.StatusCode.DEADLINE_EXCEEDED,
+                grpc.StatusCode.INTERNAL,
+            )
+    except ImportError:
+        pass
+    return False
+
+
+async def _with_llm_retry(fn):
+    """Run async fn() with exponential backoff on transient LLM errors."""
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(settings.RETRY_MAX_ATTEMPTS),
+        wait=wait_random_exponential(
+            multiplier=settings.RETRY_BACKOFF_BASE_SECONDS,
+            max=settings.RETRY_BACKOFF_MAX_SECONDS,
+        ),
+        retry=retry_if_exception(_is_transient_llm_error),
+        reraise=True,
+    ):
+        with attempt:
+            return await fn()
 
 
 def _fix_invalid_unicode_escapes(s: str) -> str:
@@ -271,14 +310,19 @@ async def summarise_in_batches(weighted: list[dict], user_ref: str) -> list[dict
     async def _run_batch(batch: list[dict], idx: int) -> list[dict]:
         async with sem:
             try:
-                batch_session = await session_service.create_session(
-                    app_name="news_bot",
-                    user_id=user_ref,
-                    state={},
-                )
                 out: list[dict] = []
                 for article in batch:
-                    out.extend(await _summarise_one(article, batch_session.id))
+                    # Fresh session per article — reusing a session across articles causes the
+                    # model to see prior turns and re-emit earlier summaries in final_digest.
+                    article_session = await session_service.create_session(
+                        app_name="news_bot",
+                        user_id=user_ref,
+                        state={},
+                    )
+                    # _run_batch's except catches Tenacity reraise — batch degrades to [] on exhaustion
+                    out.extend(await _with_llm_retry(
+                        lambda a=article, sid=article_session.id: _summarise_one(a, sid)
+                    ))
                 return out
             except Exception as exc:
                 logger.error(
@@ -355,14 +399,14 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
                 return _parse_llm_json(raw_curated)
             return raw_curated or []
 
-        parsed_curated = await _run_curator()
-        # One retry if curator produced nothing despite non-empty raw_articles
+        parsed_curated = await _with_llm_retry(_run_curator)
+        # One retry if curator produced nothing despite non-empty raw_articles (quality, not rate-limit)
         if not parsed_curated and raw_articles_list:
             logger.warning(
                 "Curator returned empty output for user %s — retrying once",
                 public_user_ref(user.telegram_id),
             )
-            parsed_curated = await _run_curator()
+            parsed_curated = await _with_llm_retry(_run_curator)
         if not parsed_curated:
             logger.warning(
                 "Curator still empty after retry for user %s — proceeding with no curated articles",
@@ -534,10 +578,10 @@ async def run_curator_for_topic(topic: str, topic_result: TopicResult) -> list[d
         parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
         return _normalize_articles(parsed)
 
-    curated = await _run()
+    curated = await _with_llm_retry(_run)
     if not curated and raw_articles_list:
         logger.warning("run_curator_for_topic(%r): empty output — retrying once", topic)
-        curated = await _run()
+        curated = await _with_llm_retry(_run)
 
     curated = validate_curated_articles(curated, valid_ids, [topic])
 
@@ -563,25 +607,30 @@ async def run_curator_for_topic(topic: str, topic_result: TopicResult) -> list[d
 async def run_summariser_for_article(art: dict) -> dict:
     """Run the summariser LLM for a single article. Returns the summary dict."""
     user_ref = "prepare_summarise"
-    session = await session_service.create_session(
-        app_name="news_bot",
-        user_id=user_ref,
-        state={},
-    )
-    async for _ in summariser_runner.run_async(
-        user_id=user_ref,
-        session_id=session.id,
-        new_message=Content(role="user", parts=[Part(text=f"user_ref: {user_ref}")]),
-        state_delta={"curated_articles": json.dumps([art])},
-    ):
-        pass
-    live = await session_service.get_session(
-        app_name="news_bot", user_id=user_ref, session_id=session.id
-    )
-    raw = live.state.get("final_digest", "[]")
-    parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
-    results = _normalize_articles(parsed)
-    return results[0] if results else {}
+
+    async def _call() -> dict:
+        # Each retry creates a new session; InMemorySessionService accepts the accumulation.
+        session = await session_service.create_session(
+            app_name="news_bot",
+            user_id=user_ref,
+            state={},
+        )
+        async for _ in summariser_runner.run_async(
+            user_id=user_ref,
+            session_id=session.id,
+            new_message=Content(role="user", parts=[Part(text=f"user_ref: {user_ref}")]),
+            state_delta={"curated_articles": json.dumps([art])},
+        ):
+            pass
+        live = await session_service.get_session(
+            app_name="news_bot", user_id=user_ref, session_id=session.id
+        )
+        raw = live.state.get("final_digest", "[]")
+        parsed = _parse_llm_json(raw) if isinstance(raw, str) else (raw or [])
+        results = _normalize_articles(parsed)
+        return results[0] if results else {}
+
+    return await _with_llm_retry(_call)
 
 
 def _flatten_curated_for_user(

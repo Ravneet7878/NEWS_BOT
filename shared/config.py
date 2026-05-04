@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     # Retries
     RETRY_MAX_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE_SECONDS: float = 0.5
+    RETRY_BACKOFF_MAX_SECONDS: float = 10.0
 
     # Privacy & guardrails
     LOG_PSEUDONYM_SALT: str = ""   # HMAC key for log pseudonymization; required in non-local envs

@@ -85,7 +85,8 @@ async def _fetch_newsdata(client: httpx.AsyncClient, query: str) -> list[dict]:
     async for attempt in AsyncRetrying(
         stop=stop_after_attempt(settings.RETRY_MAX_ATTEMPTS),
         wait=wait_random_exponential(
-            multiplier=settings.RETRY_BACKOFF_BASE_SECONDS, max=10.0
+            multiplier=settings.RETRY_BACKOFF_BASE_SECONDS,
+            max=settings.RETRY_BACKOFF_MAX_SECONDS,
         ),
         retry=retry_if_exception_type(
             (httpx.TimeoutException, httpx.ConnectError, _RetriableHTTPError)
