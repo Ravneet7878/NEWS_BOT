@@ -50,3 +50,5 @@ steps:
       - --no-allow-unauthenticated
       - --memory=1Gi
       - --max-instances=1
+      - --timeout=1800
+      - --concurrency=1

@@ -814,6 +814,12 @@ async def prepare_digests(request: Request) -> dict:
             if art.get("url") in summary_by_url
         ]
         digest_articles = _filter_deliverable_articles(digest_articles)
+        if not digest_articles:
+            logger.warning(
+                "prepare_digests: empty digest for %s — skipping save",
+                public_user_ref(user.telegram_id),
+            )
+            continue
         try:
             await db.save_pending_digest(
                 user.telegram_id, target_date, target_hour, digest_articles
@@ -870,7 +876,13 @@ async def deliver_digests(request: Request) -> dict:
 
             articles_json = json.dumps(pending.get("articles", []))
             # Raises on Telegram failure — Firestore writes only happen after confirmed delivery.
-            await send_digest_message(user.telegram_id, articles_json)
+            result = await send_digest_message(user.telegram_id, articles_json)
+            if result.get("messages_sent", 0) == 0:
+                logger.warning(
+                    "deliver_digests: 0 messages sent for %s (empty digest) — skipping state update",
+                    public_user_ref(user.telegram_id),
+                )
+                return
             sent_at = utc_now()
             await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
             await db.update_user(

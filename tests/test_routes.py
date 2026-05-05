@@ -216,7 +216,7 @@ class TestWorkerRoutes:
         user = make_user(telegram_id="1", total_digests_sent=2)
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": [{"article_id": "a1"}]}))
-        monkeypatch.setattr(main, "send_digest_message", AsyncMock())
+        monkeypatch.setattr(main, "send_digest_message", AsyncMock(return_value={"status": "delivered", "messages_sent": 1}))
         monkeypatch.setattr(main.db, "save_user_digest_history", AsyncMock())
         update_user = AsyncMock()
         mark_delivered = AsyncMock()
@@ -243,3 +243,75 @@ class TestWorkerRoutes:
 
         assert result == {"delivered": 1, "errors": 0}
         process_user.assert_awaited_once_with(user, prefetched={})
+
+    def test_prepare_digests_skips_save_for_empty_digest(self, monkeypatch) -> None:
+        from worker import main
+
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        monkeypatch.setattr(main, "prefetch_topic_news", AsyncMock(return_value={}))
+        # Curator returns empty — no articles for this user
+        monkeypatch.setattr(main.llm_cache, "get_cached_curated_topic", AsyncMock(return_value=[]))
+        save_pending = AsyncMock()
+        monkeypatch.setattr(main.db, "save_pending_digest", save_pending)
+
+        result = asyncio.run(main.prepare_digests(object()))
+
+        assert result["prepared"] == 1
+        save_pending.assert_not_awaited()
+
+    def test_deliver_digests_skips_state_update_when_zero_messages_sent(self, monkeypatch) -> None:
+        from worker import main
+
+        user = make_user(telegram_id="1", total_digests_sent=5)
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": []}))
+        monkeypatch.setattr(
+            main,
+            "send_digest_message",
+            AsyncMock(return_value={"status": "delivered", "messages_sent": 0}),
+        )
+        update_user = AsyncMock()
+        mark_delivered = AsyncMock()
+        save_history = AsyncMock()
+        monkeypatch.setattr(main.db, "update_user", update_user)
+        monkeypatch.setattr(main.db, "mark_pending_delivered", mark_delivered)
+        monkeypatch.setattr(main.db, "save_user_digest_history", save_history)
+
+        result = asyncio.run(main.deliver_digests(object()))
+
+        assert result == {"delivered": 1, "errors": 0}
+        update_user.assert_not_awaited()
+        mark_delivered.assert_not_awaited()
+        save_history.assert_not_awaited()
+
+    def test_deliver_digests_skips_state_update_when_pending_articles_empty(self, monkeypatch) -> None:
+        from worker import main
+
+        user = make_user(telegram_id="1", total_digests_sent=3)
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        # Pending digest exists but articles list is empty (e.g., /prepare saved before guard was added)
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": []}))
+        monkeypatch.setattr(
+            main,
+            "send_digest_message",
+            AsyncMock(return_value={"status": "delivered", "messages_sent": 0}),
+        )
+        update_user = AsyncMock()
+        monkeypatch.setattr(main.db, "update_user", update_user)
+        monkeypatch.setattr(main.db, "mark_pending_delivered", AsyncMock())
+        monkeypatch.setattr(main.db, "save_user_digest_history", AsyncMock())
+
+        asyncio.run(main.deliver_digests(object()))
+
+        update_user.assert_not_awaited()
+        assert user.total_digests_sent == 3
