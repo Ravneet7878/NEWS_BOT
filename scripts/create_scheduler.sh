@@ -5,16 +5,16 @@
 #   - /deliver  at :00 (delivers pre-built digests; retries if /prepare is still running)
 #
 # Prerequisites:
-#   Grant the worker SA invoke rights on the worker service:
+#   Grant the Scheduler invoker SA invoke rights on the worker service:
 #     gcloud run services add-iam-policy-binding news-bot-worker \
 #       --region=asia-south1 --project=$PROJECT_ID \
-#       --member="serviceAccount:news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com" \
+#       --member="serviceAccount:scheduler-invoker-sa@$PROJECT_ID.iam.gserviceaccount.com" \
 #       --role="roles/run.invoker"
 set -euo pipefail
 
 : "${PROJECT_ID:?PROJECT_ID environment variable must be set}"
 REGION="asia-south1"
-SCHEDULER_SA="news-bot-worker-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+SCHEDULER_SA="scheduler-invoker-sa@${PROJECT_ID}.iam.gserviceaccount.com"
 
 WORKER_URL=$(gcloud run services describe news-bot-worker \
   --region "$REGION" --project "$PROJECT_ID" \
