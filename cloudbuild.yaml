@@ -19,8 +19,8 @@ steps:
       - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA
       - --region=asia-south1
       - --service-account=news-bot-api-sa@$PROJECT_ID.iam.gserviceaccount.com
-      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1
-      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,WEBHOOK_SECRET_TOKEN=webhook-secret-token:latest,ADMIN_TELEGRAM_ID=admin-telegram-id:latest
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1,APP_ENV=prod
+      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,WEBHOOK_SECRET_TOKEN=webhook-secret-token:latest,ADMIN_TELEGRAM_ID=admin-telegram-id:latest,LOG_PSEUDONYM_SALT=log-pseudonym-salt:latest
       - --allow-unauthenticated
       - --memory=512Mi
       - --max-instances=1
@@ -45,8 +45,8 @@ steps:
       - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA
       - --region=asia-south1
       - --service-account=news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com
-      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1
-      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,NEWSDATA_API_KEY=NEWSDATA_API_KEY:latest
+      - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1,APP_ENV=prod,GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=asia-south1
+      - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,NEWSDATA_API_KEY=NEWSDATA_API_KEY:latest,LOG_PSEUDONYM_SALT=log-pseudonym-salt:latest
       - --no-allow-unauthenticated
       - --memory=1Gi
       - --max-instances=1

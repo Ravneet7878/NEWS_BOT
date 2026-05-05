@@ -7,8 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY shared/ ./shared/
+COPY utils/ ./utils/
 
 ARG SERVICE
+ENV SERVICE=${SERVICE}
 COPY ${SERVICE}/ ./${SERVICE}/
 
 USER appuser

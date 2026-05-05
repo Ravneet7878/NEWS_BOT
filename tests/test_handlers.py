@@ -49,43 +49,43 @@ class TestOnboardingHandlers:
         update = FakeUpdate(user_id=123)
         monkeypatch.setattr(onboarding.db, "get_user", AsyncMock(return_value=None))
 
-        monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            onboarding.db, "claim_invite_code_and_create_user",
+            AsyncMock(side_effect=ValueError("not_found")),
+        )
         assert asyncio.run(onboarding.handle_start(update, fake_context("BAD"))) == ConversationHandler.END
         assert "doesn't exist" in update.message.replies[-1]["text"]
 
-        invite = InviteCode(code="USED", is_used=True, used_by="999", created_at=datetime.now(timezone.utc))
-        monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=invite))
+        monkeypatch.setattr(
+            onboarding.db, "claim_invite_code_and_create_user",
+            AsyncMock(side_effect=ValueError("already_used")),
+        )
         assert asyncio.run(onboarding.handle_start(update, fake_context("USED"))) == ConversationHandler.END
         assert "already been used" in update.message.replies[-1]["text"]
 
-        expired = InviteCode(
-            code="OLD",
-            created_at=datetime.now(timezone.utc),
-            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
+        monkeypatch.setattr(
+            onboarding.db, "claim_invite_code_and_create_user",
+            AsyncMock(side_effect=ValueError("expired")),
         )
-        monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=expired))
         assert asyncio.run(onboarding.handle_start(update, fake_context("OLD"))) == ConversationHandler.END
         assert "expired" in update.message.replies[-1]["text"]
 
     def test_start_creates_user_and_marks_code_used(self, monkeypatch) -> None:
         from api.handlers import onboarding
 
-        create_user = AsyncMock()
-        mark_code_used = AsyncMock()
-        invite = InviteCode(code="JOIN", created_at=datetime.now(timezone.utc))
+        claim = AsyncMock()
         monkeypatch.setattr(onboarding.db, "get_user", AsyncMock(return_value=None))
-        monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=invite))
-        monkeypatch.setattr(onboarding.db, "create_user", create_user)
-        monkeypatch.setattr(onboarding.db, "mark_code_used", mark_code_used)
+        monkeypatch.setattr(onboarding.db, "claim_invite_code_and_create_user", claim)
         update = FakeUpdate(user_id=123, first_name="Ada")
 
         result = asyncio.run(onboarding.handle_start(update, fake_context("join")))
 
         assert result == onboarding.AWAITING_TOPICS
-        created = create_user.await_args.args[0]
-        assert created.telegram_id == "123"
-        assert created.invite_code_used == "JOIN"
-        mark_code_used.assert_awaited_once_with("JOIN", "123")
+        code_arg, tid_arg, user_arg = claim.await_args.args
+        assert code_arg == "JOIN"
+        assert tid_arg == "123"
+        assert user_arg.telegram_id == "123"
+        assert user_arg.invite_code_used == "JOIN"
         assert "What topics" in update.message.replies[-1]["text"]
 
     def test_start_existing_done_user_ends_conversation(self, monkeypatch) -> None:
@@ -160,7 +160,7 @@ class TestUserCommands:
         update_user = AsyncMock()
         delete_user = AsyncMock()
         monkeypatch.setattr(commands.db, "update_user", update_user)
-        monkeypatch.setattr(commands.db, "delete_user", delete_user)
+        monkeypatch.setattr(commands.db, "delete_user_data", delete_user)
 
         pause = FakeUpdate(user_id=123)
         asyncio.run(commands.handle_pause(pause, fake_context()))
@@ -172,7 +172,7 @@ class TestUserCommands:
 
         delete = FakeUpdate(user_id=123)
         asyncio.run(commands.handle_confirmdelete(delete, fake_context()))
-        delete_user.assert_awaited_once_with("123")
+        delete_user.assert_awaited_once_with("123")  # now calls delete_user_data
 
     def test_topics_command_preserves_existing_weights_and_validates_usage(self, monkeypatch) -> None:
         from api.handlers import commands

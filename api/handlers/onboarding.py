@@ -116,19 +116,6 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             return ConversationHandler.END
 
         code = args[0].strip().upper()
-        invite = await db.get_invite_code(code)
-
-        if invite is None:
-            await update.message.reply_text("That invite code doesn't exist. Please check and try again.")
-            return ConversationHandler.END
-
-        if invite.is_used and invite.used_by != telegram_id:
-            await update.message.reply_text("That invite code has already been used.")
-            return ConversationHandler.END
-
-        if invite.expires_at and as_aware_utc(invite.expires_at) < utc_now():
-            await update.message.reply_text("That invite code has expired.")
-            return ConversationHandler.END
 
         if existing_user is None:
             new_user = User(
@@ -139,8 +126,35 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 created_at=utc_now(),
                 onboarding_state=OnboardingState.AWAITING_TOPICS,
             )
-            await db.create_user(new_user)
-            await db.mark_code_used(code, telegram_id)
+            try:
+                await db.claim_invite_code_and_create_user(code, telegram_id, new_user)
+            except ValueError as ve:
+                reason = str(ve)
+                if reason == "not_found":
+                    await update.message.reply_text(
+                        "That invite code doesn't exist. Please check and try again."
+                    )
+                elif reason == "already_used":
+                    await update.message.reply_text("That invite code has already been used.")
+                elif reason == "expired":
+                    await update.message.reply_text("That invite code has expired.")
+                else:
+                    await update.message.reply_text("Something went wrong. Please try again.")
+                return ConversationHandler.END
+        else:
+            # User exists but hasn't finished onboarding — verify the code is still theirs
+            invite = await db.get_invite_code(code)
+            if invite is None:
+                await update.message.reply_text(
+                    "That invite code doesn't exist. Please check and try again."
+                )
+                return ConversationHandler.END
+            if invite.is_used and invite.used_by != telegram_id:
+                await update.message.reply_text("That invite code has already been used.")
+                return ConversationHandler.END
+            if invite.expires_at and as_aware_utc(invite.expires_at) < utc_now():
+                await update.message.reply_text("That invite code has expired.")
+                return ConversationHandler.END
 
         first_name = update.effective_user.first_name or "there"
         await update.message.reply_text(

@@ -95,20 +95,29 @@ def _fix_invalid_unicode_escapes(s: str) -> str:
 
 
 def _parse_llm_json(raw: str) -> list:
-    """Strip markdown fences, fix bad unicode escapes, then parse LLM JSON to a list."""
+    """Strip markdown fences, fix bad unicode escapes, then parse LLM JSON to a list.
+
+    Always returns a list. If the top-level parse produces a non-list (e.g. the model
+    wrapped the array in a JSON object), falls through to regex array extraction.
+    """
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip())
     raw = re.sub(r"\s*```$", "", raw.strip())
     if not raw.strip():
         return []
     for candidate in (raw, _fix_invalid_unicode_escapes(raw)):
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, list):
+                return parsed
+            # Non-list (e.g. dict wrapper) — fall through to regex extraction
         except (json.JSONDecodeError, ValueError):
             pass
         m = re.search(r"\[[\s\S]*\]", candidate)
         if m:
             try:
-                return json.loads(m.group(0))
+                result = json.loads(m.group(0))
+                if isinstance(result, list):
+                    return result
             except (json.JSONDecodeError, ValueError):
                 pass
     return []
@@ -359,7 +368,7 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
         _pending = await db.get_pending_digest(user.telegram_id, _today, _utc_hour)
         if _pending:
             _pending_articles = _pending.get("articles") or []
-            if _pending.get("delivered_at") is not None:
+            if _pending.get("delivered_at") is not None and _pending_articles:
                 logger.info(
                     "process_user: digest already delivered for user %s hour %d — skipping",
                     public_user_ref(user.telegram_id), _utc_hour,
@@ -426,14 +435,14 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
             return raw_curated or []
 
         parsed_curated = await _with_llm_retry(_run_curator)
-        # One retry if curator produced nothing despite non-empty raw_articles (quality, not rate-limit)
-        if not parsed_curated and raw_articles_list:
+        # One retry if curator produced nothing (or a non-list) despite non-empty raw_articles
+        if (not parsed_curated or not isinstance(parsed_curated, list)) and raw_articles_list:
             logger.warning(
                 "Curator returned empty output for user %s — retrying once",
                 public_user_ref(user.telegram_id),
             )
             parsed_curated = await _with_llm_retry(_run_curator)
-        if not parsed_curated:
+        if not parsed_curated or not isinstance(parsed_curated, list):
             logger.warning(
                 "Curator still empty after retry for user %s — falling back to raw articles",
                 public_user_ref(user.telegram_id),
@@ -530,6 +539,12 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
             _article_count,
             len(final_digest_json),
         )
+        if _article_count == 0:
+            logger.warning(
+                "process_user: empty final digest for user %s — skipping delivery this hour",
+                public_user_ref(user.telegram_id),
+            )
+            return
         await send_digest_message(user.telegram_id, final_digest_json)
         try:
             _final_articles = _normalize_articles(json.loads(final_digest_json))
@@ -854,8 +869,15 @@ async def deliver_digests(request: Request) -> dict:
                 return
 
             articles_json = json.dumps(pending.get("articles", []))
+            # Raises on Telegram failure — Firestore writes only happen after confirmed delivery.
             await send_digest_message(user.telegram_id, articles_json)
             sent_at = utc_now()
+            await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
+            await db.update_user(
+                user.telegram_id,
+                last_digest_sent=sent_at,
+                total_digests_sent=user.total_digests_sent + 1,
+            )
             try:
                 await db.save_user_digest_history(
                     user.telegram_id, pending.get("articles", []), sent_at
@@ -865,12 +887,6 @@ async def deliver_digests(request: Request) -> dict:
                     "deliver_digests: save_user_digest_history(%s) failed: %s",
                     public_user_ref(user.telegram_id), hist_exc, exc_info=True,
                 )
-            await db.update_user(
-                user.telegram_id,
-                last_digest_sent=sent_at,
-                total_digests_sent=user.total_digests_sent + 1,
-            )
-            await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
             logger.info("deliver_digests: delivered to %s", public_user_ref(user.telegram_id))
 
     results = await asyncio.gather(*[_deliver_one(u) for u in users], return_exceptions=True)
@@ -879,7 +895,12 @@ async def deliver_digests(request: Request) -> dict:
         "deliver_digests complete: delivered=%d errors=%d (UTC hour %d)",
         len(users), error_count, target_hour,
     )
-    return {"delivered": len(users), "errors": error_count}
+    if error_count > 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"deliver_digests: {error_count}/{len(users)} users failed (UTC hour {target_hour})",
+        )
+    return {"delivered": len(users), "errors": 0}
 
 
 @app.post("/run")
@@ -931,7 +952,12 @@ async def run_digests(request: Request) -> dict:
         error_count,
         utc_hour,
     )
-    return {"users_processed": len(users), "errors": error_count}
+    if error_count > 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"run_digests: {error_count}/{len(users)} users failed (UTC hour {utc_hour})",
+        )
+    return {"users_processed": len(users), "errors": 0}
 
 
 @app.get("/health")

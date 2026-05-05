@@ -351,7 +351,8 @@ class TestTelegramFormatting:
         assert result["messages_sent"] == 1
         assert len(sent[0]["text"]) <= 4096
 
-    def test_send_digest_message_returns_error_on_send_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_send_digest_message_raises_on_send_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import pytest as _pytest
         from worker.tools import telegram_tools
 
         async def fake_send(**kwargs):
@@ -359,6 +360,5 @@ class TestTelegramFormatting:
 
         monkeypatch.setattr(telegram_tools, "_send_with_retry", fake_send)
 
-        result = asyncio.run(telegram_tools.send_digest_message("123", json.dumps([{"summary": "x"}])))
-
-        assert "telegram down" in result["error"]
+        with _pytest.raises(RuntimeError, match="telegram down"):
+            asyncio.run(telegram_tools.send_digest_message("123", json.dumps([{"summary": "x"}])))

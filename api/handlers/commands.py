@@ -236,7 +236,7 @@ async def handle_confirmdelete(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         if not await _require_user(update):
             return
-        await db.delete_user(telegram_id)
+        await db.delete_user_data(telegram_id)
         await update.message.reply_text(
             "Your account has been deleted. Goodbye! 👋\n"
             "If you ever want to return, you'll need a new invite code."

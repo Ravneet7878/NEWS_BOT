@@ -1,7 +1,10 @@
 """Per-run topic prefetch: cache-aside over Firestore, parallel citation checks."""
 
 import asyncio
+import ipaddress
+import socket
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import httpx
 from tenacity import (
@@ -53,9 +56,40 @@ def _is_http_url(url: object) -> bool:
     return isinstance(url, str) and url.startswith(("http://", "https://"))
 
 
+def _is_private_host(hostname: str) -> bool:
+    """Return True if the hostname resolves to a private/loopback/link-local address.
+
+    Returns False for unresolvable hostnames — the subsequent HTTP request will
+    fail on its own; we only want to block hosts that resolve to internal infrastructure.
+    """
+    try:
+        addr = ipaddress.ip_address(socket.gethostbyname(hostname))
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except socket.gaierror:
+        return False  # DNS failure — not a private IP, let the HTTP call fail naturally
+    except ValueError:
+        return True  # Malformed IP literal — block it
+
+
+def _is_ssrf_safe(url: str) -> bool:
+    """Return False for URLs targeting internal/metadata infrastructure."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ""
+        # Explicitly block GCP metadata endpoint by name before DNS
+        if hostname in ("metadata.google.internal", "metadata.google.com"):
+            return False
+        return not _is_private_host(hostname)
+    except Exception:
+        return False
+
+
 async def _classify_citation_url(client: httpx.AsyncClient, url: object) -> str:
     """Classify URL reachability without treating bot-blocking as broken."""
     if not _is_http_url(url):
+        return "broken"
+    if not _is_ssrf_safe(str(url)):
+        logger.warning("_classify_citation_url: blocked SSRF attempt for %s", url)
         return "broken"
     try:
         resp = await client.head(str(url), timeout=5.0)

@@ -4,6 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from google.cloud.firestore_v1 import FieldFilter  # type: ignore[import-untyped]
 from google.cloud.firestore_v1.async_client import AsyncClient  # type: ignore[import-untyped]
+from google.cloud.firestore_v1.async_transaction import async_transactional  # type: ignore[import-untyped]
 
 from shared.config import settings
 from shared.models import InviteCode, OnboardingState, User
@@ -68,6 +69,32 @@ async def delete_user(telegram_id: str) -> None:
         raise
 
 
+async def delete_user_data(telegram_id: str) -> None:
+    """Delete the user document plus all owned digest history and pending digest docs."""
+    import asyncio
+
+    async def _delete_all(collection: str, field: str, value: str) -> None:
+        docs = (
+            await _db.collection(collection)
+            .where(filter=FieldFilter(field, "==", value))
+            .get()
+        )
+        if docs:
+            await asyncio.gather(*[doc.reference.delete() for doc in docs])
+
+    try:
+        await asyncio.gather(
+            _db.collection(_USERS_COL).document(telegram_id).delete(),
+            # pending_digests stores the plain telegram_id
+            _delete_all(_PENDING_COL, "telegram_id", telegram_id),
+            # user_digest_history stores the pseudonymized user_ref
+            _delete_all(_DIGEST_HISTORY_COL, "user_ref", public_user_ref(telegram_id)),
+        )
+    except Exception as exc:
+        logger.error("delete_user_data(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Invite code helpers
 # ---------------------------------------------------------------------------
@@ -97,6 +124,81 @@ async def mark_code_used(code: str, used_by: str) -> None:
         )
     except Exception as exc:
         logger.error("mark_code_used(%s) failed: %s", code, exc, exc_info=True)
+        raise
+
+
+class _InviteNotFound(Exception):
+    pass
+
+
+class _InviteAlreadyUsed(Exception):
+    pass
+
+
+class _InviteExpired(Exception):
+    pass
+
+
+@async_transactional
+async def _claim_invite_txn(
+    transaction: object,
+    invite_ref: object,
+    user_ref: object,
+    new_user_data: dict,
+    telegram_id: str,
+) -> None:
+    """Transactional inner: validate invite, create user, mark code used atomically."""
+    from utils.time import as_aware_utc  # local import avoids circular at module level
+
+    invite_snap = await transaction.get(invite_ref)  # type: ignore[union-attr]
+    if not invite_snap.exists:
+        raise _InviteNotFound()
+    invite = invite_snap.to_dict() or {}
+    if invite.get("is_used") and invite.get("used_by") != telegram_id:
+        raise _InviteAlreadyUsed()
+    expires_at = invite.get("expires_at")
+    if expires_at and as_aware_utc(expires_at) < utc_now():
+        raise _InviteExpired()
+    transaction.update(  # type: ignore[union-attr]
+        invite_ref,
+        {"is_used": True, "used_by": telegram_id, "used_at": utc_now()},
+    )
+    user_snap = await transaction.get(user_ref)  # type: ignore[union-attr]
+    if not user_snap.exists:
+        transaction.set(user_ref, new_user_data)  # type: ignore[union-attr]
+
+
+async def claim_invite_code_and_create_user(
+    code: str,
+    telegram_id: str,
+    new_user: "User",
+) -> None:
+    """Atomically validate + claim an invite code and create the user document.
+
+    Raises ValueError with a reason key ("not_found", "already_used", "expired").
+    """
+    invite_ref = _db.collection(_INVITE_CODES_COL).document(code)
+    user_ref = _db.collection(_USERS_COL).document(telegram_id)
+    transaction = _db.transaction()
+    try:
+        await _claim_invite_txn(
+            transaction,
+            invite_ref,
+            user_ref,
+            new_user.model_dump(mode="json"),
+            telegram_id,
+        )
+    except _InviteNotFound:
+        raise ValueError("not_found")
+    except _InviteAlreadyUsed:
+        raise ValueError("already_used")
+    except _InviteExpired:
+        raise ValueError("expired")
+    except Exception as exc:
+        logger.error(
+            "claim_invite_code_and_create_user(%s/%s) failed: %s",
+            code, public_user_ref(telegram_id), exc, exc_info=True,
+        )
         raise
 
 

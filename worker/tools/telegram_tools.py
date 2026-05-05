@@ -104,112 +104,107 @@ async def send_digest_message(telegram_id: str, digest_text: str) -> dict:
     Messages exceeding Telegram's 4096-char limit are trimmed safely.
 
     Returns: {"status": "delivered", "messages_sent": int}
+    Raises on Telegram network/API failure (after retries exhaust).
     """
+    # digest_text may be a JSON array (from ADK session state) or plain text
+    articles: list[dict] = []
     try:
-        # digest_text may be a JSON array (from ADK session state) or plain text
-        articles: list[dict] = []
-        try:
-            articles = json.loads(digest_text)
-        except (json.JSONDecodeError, TypeError):
-            # Fall back to "---" split plain text
-            blocks = [b.strip() for b in digest_text.split("---") if b.strip()]
-            articles = [{"title": "", "url": "", "topic": "", "summary": b} for b in blocks]
+        articles = json.loads(digest_text)
+    except (json.JSONDecodeError, TypeError):
+        # Fall back to "---" split plain text
+        blocks = [b.strip() for b in digest_text.split("---") if b.strip()]
+        articles = [{"title": "", "url": "", "topic": "", "summary": b} for b in blocks]
 
-        messages_sent = 0
-        for article in articles:
-            title: str = article.get("title", "")
-            topic: str = article.get("topic", "")
-            source: str = article.get("source", "")
-            url: str = article.get("url", "")
-            citation_status: str = article.get("citation_status", "valid")
-            published_at: str = article.get("published_at", "")
-            points: list[str] = list(article.get("summary_points") or [])
-            why: str = article.get("why_it_matters", "")
+    messages_sent = 0
+    for article in articles:
+        title: str = article.get("title", "")
+        topic: str = article.get("topic", "")
+        source: str = article.get("source", "")
+        url: str = article.get("url", "")
+        citation_status: str = article.get("citation_status", "valid")
+        published_at: str = article.get("published_at", "")
+        points: list[str] = list(article.get("summary_points") or [])
+        why: str = article.get("why_it_matters", "")
 
-            # Backward compatibility: old-format articles have a flat "summary" field
-            if not points and not why:
-                legacy = article.get("summary", "")
-                if legacy:
-                    points = [legacy]
+        # Backward compatibility: old-format articles have a flat "summary" field
+        if not points and not why:
+            legacy = article.get("summary", "")
+            if legacy:
+                points = [legacy]
 
-            # Deduplicate bullets (preserve order, case-insensitive)
-            seen: set[str] = set()
-            unique_points: list[str] = []
-            for p in points:
-                if p.lower() not in seen:
-                    seen.add(p.lower())
-                    unique_points.append(p)
-            points = unique_points
+        # Deduplicate bullets (preserve order, case-insensitive)
+        seen: set[str] = set()
+        unique_points: list[str] = []
+        for p in points:
+            if p.lower() not in seen:
+                seen.add(p.lower())
+                unique_points.append(p)
+        points = unique_points
 
-            if len(points) < 5:
-                logger.warning("Article '%s' has only %d bullets (< 5)", title, len(points))
+        if len(points) < 5:
+            logger.warning("Article '%s' has only %d bullets (< 5)", title, len(points))
 
-            # URL validation — only link if it starts with http:// or https://
-            url_valid = isinstance(url, str) and url.startswith(("http://", "https://"))
-            safe_url = html.escape(url, quote=True) if url_valid else ""
+        # URL validation — only link if it starts with http:// or https://
+        url_valid = isinstance(url, str) and url.startswith(("http://", "https://"))
+        safe_url = html.escape(url, quote=True) if url_valid else ""
 
-            date_str = f"Date: {published_at}" if published_at else "Date: Unknown"
+        date_str = f"Date: {published_at}" if published_at else "Date: Unknown"
 
-            # Combined topic + source + date meta line
-            if source and url_valid and citation_status == "valid":
-                meta_line = (
-                    f'🏷 <b>{html.escape(topic)}</b> • 📰 <a href="{safe_url}">{html.escape(source)}</a>'
-                    f" | {html.escape(date_str)}"
-                )
-            elif source and citation_status == "blocked":
-                meta_line = (
-                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
-                    f"(citation unavailable: publisher blocked verification) | {html.escape(date_str)}"
-                )
-            elif source and not url_valid:
-                meta_line = (
-                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
-                    f"(citation unavailable: no URL) | {html.escape(date_str)}"
-                )
-            elif source:
-                meta_line = (
-                    f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)}"
-                    f" | {html.escape(date_str)}"
-                )
-            elif topic:
-                meta_line = f"🏷 <b>{html.escape(topic)}</b> | {html.escape(date_str)}"
-            else:
-                meta_line = html.escape(date_str) if published_at else ""
+        # Combined topic + source + date meta line
+        if source and url_valid and citation_status == "valid":
+            meta_line = (
+                f'🏷 <b>{html.escape(topic)}</b> • 📰 <a href="{safe_url}">{html.escape(source)}</a>'
+                f" | {html.escape(date_str)}"
+            )
+        elif source and citation_status == "blocked":
+            meta_line = (
+                f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
+                f"(citation unavailable: publisher blocked verification) | {html.escape(date_str)}"
+            )
+        elif source and not url_valid:
+            meta_line = (
+                f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)} "
+                f"(citation unavailable: no URL) | {html.escape(date_str)}"
+            )
+        elif source:
+            meta_line = (
+                f"🏷 <b>{html.escape(topic)}</b> • 📰 {html.escape(source)}"
+                f" | {html.escape(date_str)}"
+            )
+        elif topic:
+            meta_line = f"🏷 <b>{html.escape(topic)}</b> | {html.escape(date_str)}"
+        else:
+            meta_line = html.escape(date_str) if published_at else ""
 
+        body = _build_article_body(title, meta_line, points, why)
+
+        # Trim strategy 1: remove trailing summary_points one at a time
+        while len(body) > _MAX_MESSAGE_LENGTH and len(points) > 1:
+            points.pop()
             body = _build_article_body(title, meta_line, points, why)
 
-            # Trim strategy 1: remove trailing summary_points one at a time
-            while len(body) > _MAX_MESSAGE_LENGTH and len(points) > 1:
-                points.pop()
-                body = _build_article_body(title, meta_line, points, why)
+        # Trim strategy 2: shorten why_it_matters
+        if len(body) > _MAX_MESSAGE_LENGTH:
+            while len(body) > _MAX_MESSAGE_LENGTH and len(why) > 10:
+                why = why[:-10]
+                body = _build_article_body(title, meta_line, points, why + "…")
 
-            # Trim strategy 2: shorten why_it_matters
-            if len(body) > _MAX_MESSAGE_LENGTH:
-                while len(body) > _MAX_MESSAGE_LENGTH and len(why) > 10:
-                    why = why[:-10]
-                    body = _build_article_body(title, meta_line, points, why + "…")
+        # Hard fallback
+        if len(body) > _MAX_MESSAGE_LENGTH:
+            body = body[: _MAX_MESSAGE_LENGTH - 1] + "…"
 
-            # Hard fallback
-            if len(body) > _MAX_MESSAGE_LENGTH:
-                body = body[: _MAX_MESSAGE_LENGTH - 1] + "…"
+        article_id: str = article.get("article_id", "")
+        keyboard = _build_feedback_keyboard(topic, article_id) if article_id and topic else None
 
-            article_id: str = article.get("article_id", "")
-            keyboard = _build_feedback_keyboard(topic, article_id) if article_id and topic else None
-
-            await _send_with_retry(
-                chat_id=telegram_id,
-                text=body,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-            )
-            messages_sent += 1
-
-        return {"status": "delivered", "messages_sent": messages_sent}
-    except Exception as exc:
-        logger.error(
-            "send_digest_message(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True
+        await _send_with_retry(
+            chat_id=telegram_id,
+            text=body,
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
-        return {"error": str(exc)}
+        messages_sent += 1
+
+    return {"status": "delivered", "messages_sent": messages_sent}
 
 
 async def send_error_to_user(telegram_id: str, error_message: str) -> dict:
@@ -217,12 +212,7 @@ async def send_error_to_user(telegram_id: str, error_message: str) -> dict:
     Send a plain-text error notification to a Telegram user.
 
     Returns: {"status": "sent"}
+    Raises on Telegram network/API failure (after retries exhaust).
     """
-    try:
-        await _send_with_retry(chat_id=telegram_id, text=error_message)
-        return {"status": "sent"}
-    except Exception as exc:
-        logger.error(
-            "send_error_to_user(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True
-        )
-        return {"error": str(exc)}
+    await _send_with_retry(chat_id=telegram_id, text=error_message)
+    return {"status": "sent"}

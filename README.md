@@ -13,24 +13,26 @@ Telegram ──► api (Cloud Run, public)
                 └─► Firestore (user data, invite codes, feedback)
 
 Cloud Scheduler ──► worker (Cloud Run, private)
-                        ├─► fetch_articles_for_user (Python, pre-pipeline — google_search + Firestore prefs)
-                        └─► ADK Pipeline (SequentialAgent)
-                                ├─► news_curator  (dedup + scoring)
-                                └─► news_summariser (prose summaries)
-                        └─► Telegram Bot API (deliver digest)
-                        └─► Firestore (update last_digest_sent, weights)
+                        ├─► /prepare  (LLM pipeline: curator + summariser, runs at :55)
+                        └─► /deliver  (Telegram delivery from cache, runs at :00)
+                        └─► Firestore (pending_digests, user_digest_history, last_digest_sent)
 ```
 
 **Why two services?**
 The `api` service handles real-time Telegram webhook events and must respond within 30 seconds. The `worker` service runs the heavy ADK pipeline (30–120 seconds per user). Separating them prevents webhook timeouts and allows each to scale independently.
 
+**Worker scheduling (two-job flow):**
+1. At `:55` — Cloud Scheduler calls `POST /prepare`: runs the ADK pipeline (curator + summariser) for all users scheduled for the next hour and caches results in `pending_digests`.
+2. At `:00` — Cloud Scheduler calls `POST /deliver`: reads pre-built digests from `pending_digests` and sends them via Telegram. Falls back to the live pipeline (`/run` logic) if `/prepare` didn't complete.
+
 **Data flow:**
-1. `api` receives `/start <code>` → validates invite → creates user in Firestore
-2. Cloud Scheduler hits `POST /run` on `worker` every hour (UTC)
-3. Worker queries Firestore for users with `delivery_hour_utc == current_hour`
-4. `fetch_articles_for_user` (Python) populates raw_articles → ADK SequentialAgent: curator → summariser (state flows via session state keys)
-5. Worker reads `final_digest` from session state and delivers via Telegram Bot API
-6. User taps 👍/👎 → `api` handles callback → updates topic weights in Firestore
+1. `api` receives `/start <code>` → validates invite (transactionally) → creates user in Firestore
+2. Cloud Scheduler hits `POST /prepare` on worker at :55 UTC
+3. Cloud Scheduler hits `POST /deliver` on worker at :00 UTC
+4. Worker queries Firestore for users with `delivery_hour_utc == current_hour`
+5. `fetch_articles_for_user` (Python) populates raw_articles → ADK SequentialAgent: curator → summariser
+6. Worker reads `final_digest` from session state and delivers via Telegram Bot API
+7. User taps 👍/👎 → `api` handles callback → updates topic weights in Firestore
 
 ---
 
@@ -69,7 +71,7 @@ gcloud iam service-accounts create news-bot-worker-sa \
   --display-name="News Bot Worker Service Account"
 
 # 6. Grant IAM roles
-# API service: Firestore read/write
+# API service: Firestore read/write + Secret Manager
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:news-bot-api-sa@$PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/datastore.user"
@@ -101,23 +103,32 @@ echo -n "YOUR_WEBHOOK_SECRET_TOKEN" | \
 echo -n "YOUR_ADMIN_TELEGRAM_ID" | \
   gcloud secrets create admin-telegram-id --data-file=-
 
-# 8. Grant Cloud Scheduler permission to invoke the worker Cloud Run service
+echo -n "YOUR_NEWSDATA_API_KEY" | \
+  gcloud secrets create NEWSDATA_API_KEY --data-file=-
+
+# Generate a random HMAC salt for log pseudonymization (required for APP_ENV=prod)
+openssl rand -hex 32 | \
+  gcloud secrets create log-pseudonym-salt --data-file=-
+
+# 8. Enable Firestore TTL policies on expiring collections
+gcloud firestore fields ttls update expires_at \
+  --collection-group=news_cache --project=$PROJECT_ID --enable-ttl
+gcloud firestore fields ttls update expires_at \
+  --collection-group=user_digest_history --project=$PROJECT_ID --enable-ttl
+gcloud firestore fields ttls update expires_at \
+  --collection-group=pending_digests --project=$PROJECT_ID --enable-ttl
+gcloud firestore fields ttls update expires_at \
+  --collection-group=curated_topics_v1 --project=$PROJECT_ID --enable-ttl
+gcloud firestore fields ttls update expires_at \
+  --collection-group=article_summaries_v1 --project=$PROJECT_ID --enable-ttl
+
+# 9. Grant Cloud Scheduler permission to invoke the worker Cloud Run service
+# (run after the worker service is first deployed)
 gcloud run services add-iam-policy-binding news-bot-worker \
   --region=asia-south1 \
   --project=$PROJECT_ID \
   --member="serviceAccount:news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/run.invoker"
-
-# 9. Create Cloud Scheduler job (calls worker every hour via OIDC)
-# Authentication is handled by Cloud Run IAM — no shared secret needed.
-gcloud scheduler jobs create http news-bot-hourly-run \
-  --location=asia-south1 \
-  --schedule="0 * * * *" \
-  --uri="https://YOUR_WORKER_URL/run" \
-  --http-method=POST \
-  --oidc-service-account-email="news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-  --oidc-token-audience="https://YOUR_WORKER_URL" \
-  --time-zone="UTC"
 
 # 10. Create Cloud Build trigger (triggers on push to main)
 gcloud builds triggers create github \
@@ -143,6 +154,44 @@ gcloud firestore indexes composite create \
 
 ---
 
+## Deploying
+
+```bash
+gcloud builds submit --config=cloudbuild.yaml --project=$PROJECT_ID
+```
+
+---
+
+## Post-Deploy Setup
+
+Run these once after the first successful deploy.
+
+```bash
+# Register the Telegram webhook (uses Secret Manager to fetch credentials)
+PROJECT_ID=$PROJECT_ID ./scripts/setup_webhook.sh
+
+# Create Cloud Scheduler jobs (two-job flow: /prepare at :55, /deliver at :00)
+PROJECT_ID=$PROJECT_ID ./scripts/create_scheduler.sh
+```
+
+### Verify the deployment
+
+```bash
+# Health check
+curl "$(gcloud run services describe news-bot-api \
+  --region=asia-south1 --project=$PROJECT_ID --format='value(status.url)')/health"
+
+# Force a Scheduler test run
+gcloud scheduler jobs run news-bot-hourly-prepare --location=asia-south1 --project=$PROJECT_ID
+gcloud scheduler jobs run news-bot-hourly-deliver --location=asia-south1 --project=$PROJECT_ID
+
+# Confirm Cloud Run env config
+gcloud run services describe news-bot-api --region=asia-south1 --project=$PROJECT_ID
+gcloud run services describe news-bot-worker --region=asia-south1 --project=$PROJECT_ID
+```
+
+---
+
 ## Local Development
 
 **Prerequisites:** Python 3.12, a GCP project with ADC configured (`gcloud auth application-default login`)
@@ -157,7 +206,7 @@ pip install -r requirements.txt
 # Copy and fill in your .env
 cp .env.example .env
 # Edit .env: set GCP_PROJECT_ID, ADMIN_TELEGRAM_ID, WEBHOOK_SECRET_TOKEN,
-# and for local dev set TELEGRAM_BOT_TOKEN directly
+# and for local dev set TELEGRAM_BOT_TOKEN and NEWSDATA_API_KEY directly
 
 # Run the API service locally
 uvicorn api.main:app --reload --port 8080
@@ -169,17 +218,23 @@ uvicorn worker.main:app --reload --port 8081
 adk web
 ```
 
-For local webhook testing, expose port 8080 with [ngrok](https://ngrok.com/):
+For local webhook testing, expose port 8080 with [ngrok](https://ngrok.com/) (local only — not used in production):
 ```bash
 ngrok http 8080
+# Then run setup_webhook.sh with the ngrok URL, or set the webhook manually
 ```
-Then register the webhook (see below) with the ngrok URL.
 
 ---
 
 ## Registering the Telegram Webhook
 
-Run after every `api` service deployment:
+Use the provided script (reads credentials from Secret Manager automatically):
+
+```bash
+PROJECT_ID=$PROJECT_ID ./scripts/setup_webhook.sh
+```
+
+Or manually:
 
 ```bash
 curl "https://api.telegram.org/bot{YOUR_BOT_TOKEN}/setWebhook" \
@@ -217,10 +272,16 @@ Set a budget alert to avoid unexpected charges:
 
 ## Environment Variables Reference
 
-| Variable              | Required | Description |
-|-----------------------|----------|-------------|
-| `GCP_PROJECT_ID`      | Yes      | GCP project ID |
-| `VERTEX_AI_LOCATION`  | No       | Vertex AI region (default: `asia-south1`) |
-| `ADMIN_TELEGRAM_ID`   | Yes      | Your Telegram user ID (integer as string) |
-| `WEBHOOK_SECRET_TOKEN`| Yes      | Random secret set in both settings and `setWebhook` call |
-| `TELEGRAM_BOT_TOKEN`  | Dev only | Loaded from Secret Manager on Cloud Run |
+| Variable                    | Service      | Source          | Description |
+|-----------------------------|--------------|-----------------|-------------|
+| `GCP_PROJECT_ID`            | both         | env var         | GCP project ID |
+| `VERTEX_AI_LOCATION`        | both         | env var         | Vertex AI region (default: `asia-south1`) |
+| `APP_ENV`                   | both         | env var         | Set to `prod` in Cloud Run; `local` for dev |
+| `GOOGLE_GENAI_USE_VERTEXAI` | worker       | env var         | Set to `1` to route ADK through Vertex AI |
+| `GOOGLE_CLOUD_PROJECT`      | worker       | env var         | Project ID for ADK/Vertex AI client |
+| `GOOGLE_CLOUD_LOCATION`     | worker       | env var         | Region for ADK/Vertex AI client |
+| `ADMIN_TELEGRAM_ID`         | api          | Secret Manager  | Your Telegram user ID (integer as string) |
+| `WEBHOOK_SECRET_TOKEN`      | api          | Secret Manager  | Random secret set in both settings and `setWebhook` |
+| `TELEGRAM_BOT_TOKEN`        | both         | Secret Manager  | Telegram Bot API token |
+| `NEWSDATA_API_KEY`          | worker       | Secret Manager  | NewsData.io API key |
+| `LOG_PSEUDONYM_SALT`        | both         | Secret Manager  | HMAC key for log pseudonymisation; required when `APP_ENV=prod` |
