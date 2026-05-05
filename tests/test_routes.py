@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -176,6 +177,52 @@ class TestWorkerRoutes:
         save_pending.assert_awaited_once()
         saved_articles = save_pending.await_args.args[3]
         assert saved_articles[0]["summary_points"] == ["point"]
+
+    def test_prepare_digests_targets_next_utc_day_before_midnight(self, monkeypatch) -> None:
+        from worker import main
+
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
+        get_users = AsyncMock(return_value=[user])
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 23, 35, tzinfo=timezone.utc))
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", get_users)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        monkeypatch.setattr(
+            main,
+            "prefetch_topic_news",
+            AsyncMock(return_value={"Tech": TopicResult("Tech", [cached_article("https://example.com/a")])}),
+        )
+        monkeypatch.setattr(main.llm_cache, "get_cached_curated_topic", AsyncMock(return_value=None))
+        monkeypatch.setattr(main.llm_cache, "set_cached_curated_topic", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "run_curator_for_topic",
+            AsyncMock(return_value=[{"article_id": "a1", "topic": "Tech", "url": "https://example.com/a", "relevance_score": 1.0}]),
+        )
+        monkeypatch.setattr(main.llm_cache, "get_cached_article_summary", AsyncMock(return_value=None))
+        monkeypatch.setattr(main.llm_cache, "set_cached_article_summary", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "run_summariser_for_article",
+            AsyncMock(return_value={"article_id": "a1", "summary_points": ["point"], "why_it_matters": "why"}),
+        )
+        save_pending = AsyncMock()
+        monkeypatch.setattr(main.db, "save_pending_digest", save_pending)
+
+        result = asyncio.run(main.prepare_digests(object()))
+
+        assert result["prepared"] == 1
+        get_users.assert_awaited_once_with(0)
+        save_pending.assert_awaited_once()
+        assert save_pending.await_args.args[1] == date(2026, 5, 5)
+        assert save_pending.await_args.args[2] == 0
 
     def test_prepare_digests_uses_cache_hits(self, monkeypatch) -> None:
         from worker import main

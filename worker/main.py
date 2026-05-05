@@ -735,15 +735,15 @@ def _dedup_articles_by_url(
 
 @app.post("/prepare")
 async def prepare_digests(request: Request) -> dict:
-    """Pre-build digests 5 minutes before the delivery hour.
+    """Pre-build digests before the delivery hour.
 
     Runs curator once per unique topic and summariser once per unique article URL,
     using Firestore caches to skip repeated LLM calls. Stores results in pending_digests
     so /deliver can send them without any LLM work.
     """
-    now = utc_now()
-    target_hour = (now.hour + 1) % 24
-    target_date = (now + timedelta(minutes=10)).date()
+    target = utc_now() + timedelta(hours=1)
+    target_hour = target.hour
+    target_date = target.date()
 
     try:
         users = await db.get_active_users_for_hour(target_hour)

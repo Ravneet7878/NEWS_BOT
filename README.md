@@ -13,7 +13,7 @@ Telegram ──► api (Cloud Run, public)
                 └─► Firestore (user data, invite codes, feedback)
 
 Cloud Scheduler ──► worker (Cloud Run, private)
-                        ├─► /prepare  (LLM pipeline: curator + summariser, runs at :55)
+                        ├─► /prepare  (LLM pipeline: curator + summariser, runs at :35)
                         └─► /deliver  (Telegram delivery from cache, runs at :00)
                         └─► Firestore (pending_digests, user_digest_history, last_digest_sent)
 ```
@@ -22,12 +22,12 @@ Cloud Scheduler ──► worker (Cloud Run, private)
 The `api` service handles real-time Telegram webhook events and must respond within 30 seconds. The `worker` service runs the heavy ADK pipeline (30–120 seconds per user). Separating them prevents webhook timeouts and allows each to scale independently.
 
 **Worker scheduling (two-job flow):**
-1. At `:55` — Cloud Scheduler calls `POST /prepare`: runs the ADK pipeline (curator + summariser) for all users scheduled for the next hour and caches results in `pending_digests`.
+1. At `:35` — Cloud Scheduler calls `POST /prepare`: runs the ADK pipeline (curator + summariser) for all users scheduled for the next hour and caches results in `pending_digests`.
 2. At `:00` — Cloud Scheduler calls `POST /deliver`: reads pre-built digests from `pending_digests` and sends them via Telegram. If `/prepare` is still running or a pending digest is missing, `/deliver` returns a retryable `503` so Scheduler retries within the hour. Use `POST /run` only for manual live recovery.
 
 **Data flow:**
 1. `api` receives `/start <code>` → validates invite (transactionally) → creates user in Firestore
-2. Cloud Scheduler hits `POST /prepare` on worker at :55 UTC
+2. Cloud Scheduler hits `POST /prepare` on worker at :35 UTC
 3. Cloud Scheduler hits `POST /deliver` on worker at :00 UTC
 4. Worker queries Firestore for users with `delivery_hour_utc == current_hour`
 5. `fetch_articles_for_user` (Python) populates raw_articles → ADK SequentialAgent: curator → summariser
@@ -170,13 +170,14 @@ Run these once after the first successful deploy.
 # Register the Telegram webhook (uses Secret Manager to fetch credentials)
 PROJECT_ID=$PROJECT_ID ./scripts/setup_webhook.sh
 
-# Create Cloud Scheduler jobs (two-job flow: /prepare at :55, /deliver at :00)
+# Create or update Cloud Scheduler jobs (two-job flow: /prepare at :35, /deliver at :00)
 PROJECT_ID=$PROJECT_ID ./scripts/create_scheduler.sh
 ```
 
 The `news-bot-hourly-deliver` job is configured with retries bounded inside the
-same UTC hour. Do not rely on Cloud Run request queuing between `/prepare` and
-`/deliver`; missing pending digests are surfaced as retryable delivery attempts.
+same UTC hour. The 25-minute prepare buffer should make missing pending digests
+rare during normal scheduled delivery; if one is still missing, `/deliver`
+surfaces it as a retryable delivery attempt.
 
 ### Verify the deployment
 

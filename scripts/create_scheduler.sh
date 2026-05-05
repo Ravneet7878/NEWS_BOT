@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Run once after the worker Cloud Run service is deployed.
-# Creates two hourly jobs:
-#   - /prepare  at :55 (pre-builds digests before the hour)
+# Run after the worker Cloud Run service is deployed.
+# Creates or updates two hourly jobs:
+#   - /prepare  at :35 (pre-builds digests before the hour)
 #   - /deliver  at :00 (delivers pre-built digests; retries if /prepare is still running)
 #
 # Prerequisites:
@@ -15,25 +15,43 @@ set -euo pipefail
 : "${PROJECT_ID:?PROJECT_ID environment variable must be set}"
 REGION="asia-south1"
 SCHEDULER_SA="scheduler-invoker-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+PREPARE_SCHEDULE="35 * * * *"
+DELIVER_SCHEDULE="0 * * * *"
 
 WORKER_URL=$(gcloud run services describe news-bot-worker \
   --region "$REGION" --project "$PROJECT_ID" \
   --format "value(status.url)")
 
-gcloud scheduler jobs create http news-bot-hourly-prepare \
-  --project="$PROJECT_ID" \
-  --location="$REGION" \
-  --schedule="55 * * * *" \
+upsert_http_job() {
+  local job_name="$1"
+  shift
+
+  if gcloud scheduler jobs describe "$job_name" \
+    --project="$PROJECT_ID" \
+    --location="$REGION" >/dev/null 2>&1; then
+    gcloud scheduler jobs update http "$job_name" \
+      --project="$PROJECT_ID" \
+      --location="$REGION" \
+      "$@"
+  else
+    gcloud scheduler jobs create http "$job_name" \
+      --project="$PROJECT_ID" \
+      --location="$REGION" \
+      "$@"
+  fi
+}
+
+upsert_http_job news-bot-hourly-prepare \
+  --schedule="$PREPARE_SCHEDULE" \
   --uri="${WORKER_URL}/prepare" \
   --http-method=POST \
   --oidc-service-account-email="$SCHEDULER_SA" \
   --oidc-token-audience="${WORKER_URL}" \
-  --time-zone="UTC"
+  --time-zone="UTC" \
+  --attempt-deadline=1800s
 
-gcloud scheduler jobs create http news-bot-hourly-deliver \
-  --project="$PROJECT_ID" \
-  --location="$REGION" \
-  --schedule="0 * * * *" \
+upsert_http_job news-bot-hourly-deliver \
+  --schedule="$DELIVER_SCHEDULE" \
   --uri="${WORKER_URL}/deliver" \
   --http-method=POST \
   --oidc-service-account-email="$SCHEDULER_SA" \
@@ -45,9 +63,9 @@ gcloud scheduler jobs create http news-bot-hourly-deliver \
   --max-backoff=600s \
   --max-doublings=1
 
-echo "Scheduler jobs created:"
-echo "  news-bot-hourly-prepare  → ${WORKER_URL}/prepare  (55 * * * * UTC)"
-echo "  news-bot-hourly-deliver  → ${WORKER_URL}/deliver  (0 * * * * UTC, retries within the hour)"
+echo "Scheduler jobs created or updated:"
+echo "  news-bot-hourly-prepare  → ${WORKER_URL}/prepare  (${PREPARE_SCHEDULE} UTC)"
+echo "  news-bot-hourly-deliver  → ${WORKER_URL}/deliver  (${DELIVER_SCHEDULE} UTC, retries within the hour)"
 echo ""
 echo "Force a test run with:"
 echo "  gcloud scheduler jobs run news-bot-hourly-prepare --location=${REGION} --project=${PROJECT_ID}"
