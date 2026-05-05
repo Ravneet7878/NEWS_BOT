@@ -363,24 +363,26 @@ async def summarise_in_batches(weighted: list[dict], user_ref: str) -> list[dict
 async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
     """Run the full pipeline for a single user and deliver the digest."""
     try:
-        _today = utc_now().date()
-        _utc_hour = utc_now().hour
-        _pending = await db.get_pending_digest(user.telegram_id, _today, _utc_hour)
+        _now = utc_now()
+        _today = _now.date()
+        _utc_hour = _now.hour
+        _utc_minute = _now.minute
+        _pending = await db.get_pending_digest(user.telegram_id, _today, _utc_hour, _utc_minute)
         if _pending:
             _pending_articles = _pending.get("articles") or []
             if _pending.get("delivered_at") is not None and _pending_articles:
                 logger.info(
-                    "process_user: digest already delivered for user %s hour %d — skipping",
-                    public_user_ref(user.telegram_id), _utc_hour,
+                    "process_user: digest already delivered for user %s %02d:%02d — skipping",
+                    public_user_ref(user.telegram_id), _utc_hour, _utc_minute,
                 )
                 return
             if _pending_articles:
                 logger.info(
-                    "process_user: pending digest HIT for user %s hour %d — skipping LLM pipeline",
-                    public_user_ref(user.telegram_id), _utc_hour,
+                    "process_user: pending digest HIT for user %s %02d:%02d — skipping LLM pipeline",
+                    public_user_ref(user.telegram_id), _utc_hour, _utc_minute,
                 )
                 await send_digest_message(user.telegram_id, json.dumps(_pending_articles))
-                await db.mark_pending_delivered(user.telegram_id, _today, _utc_hour)
+                await db.mark_pending_delivered(user.telegram_id, _today, _utc_hour, _utc_minute)
                 await db.update_user(
                     user.telegram_id,
                     last_digest_sent=utc_now(),
@@ -735,30 +737,51 @@ def _dedup_articles_by_url(
 
 @app.post("/prepare")
 async def prepare_digests(request: Request) -> dict:
-    """Pre-build digests before the delivery hour.
+    """Pre-build digests for users whose delivery slot falls in the next PREPARE_BUFFER_MINUTES window.
 
-    Runs curator once per unique topic and summariser once per unique article URL,
-    using Firestore caches to skip repeated LLM calls. Stores results in pending_digests
-    so /deliver can send them without any LLM work.
+    Per-minute cadence: runs every minute. Builds a forward-looking slot list, fetches users
+    whose (hour, minute) matches any slot, skips those with an existing pending doc, and builds
+    the rest. Idempotent under overlapping invocations.
     """
-    target = utc_now() + timedelta(hours=1)
-    target_hour = target.hour
-    target_date = target.date()
+    now = utc_now()
+    window_end = now + timedelta(minutes=settings.PREPARE_BUFFER_MINUTES)
+    cursor = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+
+    slots: list[tuple] = []
+    while cursor <= window_end:
+        slots.append((cursor.date(), cursor.hour, cursor.minute))
+        cursor += timedelta(minutes=1)
+
+    hours = sorted({h for _, h, _ in slots})
+    slot_lookup: dict[tuple[int, int], "date"] = {(h, m): d for d, h, m in slots}
 
     try:
-        users = await db.get_active_users_for_hour(target_hour)
+        candidates = await db.get_active_users_for_window(hours)
     except Exception as exc:
         logger.error("prepare_digests: failed to fetch users: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch users")
 
-    if not users:
-        logger.info("prepare_digests: no users for UTC hour %d", target_hour)
+    # Filter to users whose slot is in the window and don't already have a pending doc
+    to_prepare: list[tuple] = []
+    for u in candidates:
+        key = (u.delivery_hour_utc, u.delivery_minute_utc)
+        if key not in slot_lookup:
+            continue
+        target_date = slot_lookup[key]
+        existing = await db.get_pending_digest(u.telegram_id, target_date, key[0], key[1])
+        if existing is not None:
+            continue
+        to_prepare.append((u, target_date, key[0], key[1]))
+
+    if not to_prepare:
+        logger.info("prepare_digests: no users to prepare in window ending %s", window_end.isoformat())
         return {"prepared": 0}
 
-    unique_topics: set[str] = {t for u in users for t in (u.topics or [])}
+    users_to_prepare = [t[0] for t in to_prepare]
+    unique_topics: set[str] = {t for u in users_to_prepare for t in (u.topics or [])}
     logger.info(
-        "prepare_digests: %d users, %d unique topics, target_hour=%d",
-        len(users), len(unique_topics), target_hour,
+        "prepare_digests: %d users, %d unique topics, window=%s–%s",
+        len(to_prepare), len(unique_topics), now.isoformat(), window_end.isoformat(),
     )
 
     async with httpx.AsyncClient(
@@ -785,7 +808,7 @@ async def prepare_digests(request: Request) -> dict:
 
     # Step 2: per-user weighted selection (pure Python, no LLM)
     per_user_selections: dict[str, list[dict]] = {}
-    for user in users:
+    for user, _td, _th, _tm in to_prepare:
         articles = _flatten_curated_for_user(curated_by_topic, user.topics)
         selected = _weighted_topic_selection(articles, user.topic_weights or {})
         per_user_selections[user.telegram_id] = selected
@@ -807,7 +830,7 @@ async def prepare_digests(request: Request) -> dict:
                 summary_by_url[url] = summary
 
     # Step 4: assemble and store pending digest per user
-    for user in users:
+    for user, target_date, target_hour, target_minute in to_prepare:
         digest_articles = [
             {**art, **summary_by_url[art["url"]]}
             for art in per_user_selections[user.telegram_id]
@@ -822,7 +845,7 @@ async def prepare_digests(request: Request) -> dict:
             continue
         try:
             await db.save_pending_digest(
-                user.telegram_id, target_date, target_hour, digest_articles
+                user.telegram_id, target_date, target_hour, digest_articles, target_minute
             )
         except Exception as exc:
             logger.error(
@@ -832,10 +855,10 @@ async def prepare_digests(request: Request) -> dict:
 
     logger.info(
         "prepare_digests complete: prepared=%d topics=%d unique_articles=%d",
-        len(users), len(unique_topics), len(unique_articles),
+        len(to_prepare), len(unique_topics), len(unique_articles),
     )
     return {
-        "prepared": len(users),
+        "prepared": len(to_prepare),
         "topics": len(unique_topics),
         "unique_articles_summarised": len(unique_articles),
     }
@@ -850,16 +873,19 @@ async def deliver_digests(request: Request) -> dict:
     """
     now = utc_now()
     target_hour = now.hour
+    target_minute = now.minute
     target_date = now.date()
 
     try:
-        users = await db.get_active_users_for_hour(target_hour)
+        all_hour_users = await db.get_active_users_for_hour(target_hour)
     except Exception as exc:
         logger.error("deliver_digests: failed to fetch users: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch users")
 
+    users = [u for u in all_hour_users if u.delivery_minute_utc == target_minute]
+
     if not users:
-        logger.info("deliver_digests: no users for UTC hour %d", target_hour)
+        logger.info("deliver_digests: no users for UTC %02d:%02d", target_hour, target_minute)
         return {
             "users_total": 0,
             "delivered": 0,
@@ -873,7 +899,7 @@ async def deliver_digests(request: Request) -> dict:
 
     async def _deliver_one(user: User) -> str:
         async with sem:
-            pending = await db.get_pending_digest(user.telegram_id, target_date, target_hour)
+            pending = await db.get_pending_digest(user.telegram_id, target_date, target_hour, target_minute)
             if pending is None:
                 logger.warning(
                     "deliver_digests: no pending digest for %s — waiting for Scheduler retry",
@@ -898,7 +924,7 @@ async def deliver_digests(request: Request) -> dict:
                 )
                 return "skipped_empty"
             sent_at = utc_now()
-            await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
+            await db.mark_pending_delivered(user.telegram_id, target_date, target_hour, target_minute)
             await db.update_user(
                 user.telegram_id,
                 last_digest_sent=sent_at,
@@ -937,7 +963,7 @@ async def deliver_digests(request: Request) -> dict:
     logger.info(
         (
             "deliver_digests complete: users=%d delivered=%d already_delivered=%d "
-            "skipped_empty=%d missing_pending=%d errors=%d (UTC hour %d)"
+            "skipped_empty=%d missing_pending=%d errors=%d (UTC %02d:%02d)"
         ),
         stats["users_total"],
         stats["delivered"],
@@ -946,6 +972,7 @@ async def deliver_digests(request: Request) -> dict:
         stats["missing_pending"],
         stats["errors"],
         target_hour,
+        target_minute,
     )
     if stats["missing_pending"] > 0:
         raise HTTPException(status_code=503, detail=stats)
@@ -963,25 +990,30 @@ async def run_digests(request: Request) -> dict:
     Trigger hourly digest delivery.
     Authentication is handled by Cloud Run IAM (OIDC via Cloud Scheduler).
     """
-    utc_hour = utc_now().hour
+    _run_now = utc_now()
+    utc_hour = _run_now.hour
+    utc_minute = _run_now.minute
     try:
-        users = await db.get_active_users_for_hour(utc_hour)
+        all_hour_users = await db.get_active_users_for_hour(utc_hour)
     except Exception as exc:
         logger.error("Failed to fetch users for hour %d: %s", utc_hour, exc, exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch users")
 
+    users = [u for u in all_hour_users if u.delivery_minute_utc == utc_minute]
+
     if not users:
-        logger.info("No users scheduled for UTC hour %d", utc_hour)
+        logger.info("No users scheduled for UTC %02d:%02d", utc_hour, utc_minute)
         return {"users_processed": 0, "errors": 0}
 
     unique_topics: set[str] = set()
     for u in users:
         unique_topics.update(u.topics or [])
     logger.info(
-        "Run starting: %d users, %d unique topics (UTC hour %d)",
+        "Run starting: %d users, %d unique topics (UTC %02d:%02d)",
         len(users),
         len(unique_topics),
         utc_hour,
+        utc_minute,
     )
 
     sem = asyncio.Semaphore(settings.USER_PROCESS_CONCURRENCY)

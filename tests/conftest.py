@@ -200,6 +200,7 @@ def make_user(**overrides: Any):
         "topics": ["Tech", "Finance"],
         "topic_weights": {"Tech": 1.0, "Finance": 1.0},
         "delivery_hour_utc": 1,
+        "delivery_minute_utc": 0,
         "delivery_tz": "Asia/Kolkata",
         "onboarding_state": OnboardingState.DONE,
         "created_at": datetime(2026, 1, 1),

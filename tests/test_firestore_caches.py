@@ -138,18 +138,38 @@ class TestDigestHistoryAndPending:
         monkeypatch.setattr(db, "public_user_ref", lambda telegram_id: f"ref-{telegram_id}")
         target_date = date(2026, 5, 4)
 
-        asyncio.run(db.save_pending_digest("123", target_date, 7, [{"article_id": "a1"}]))
+        asyncio.run(db.save_pending_digest("123", target_date, 7, [{"article_id": "a1"}], target_minute=0))
 
-        doc_id = "ref-123_2026-05-04_07"
+        doc_id = "ref-123_2026-05-04_0700"
         assert fake_db.stores["pending_digests"][doc_id]["target_hour"] == 7
+        assert fake_db.stores["pending_digests"][doc_id]["target_minute"] == 0
 
-        pending = asyncio.run(db.get_pending_digest("123", target_date, 7))
+        pending = asyncio.run(db.get_pending_digest("123", target_date, 7, target_minute=0))
         assert pending["articles"] == [{"article_id": "a1"}]
 
         fake_db.stores["pending_digests"][doc_id]["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
-        assert asyncio.run(db.get_pending_digest("123", target_date, 7)) is None
+        assert asyncio.run(db.get_pending_digest("123", target_date, 7, target_minute=0)) is None
 
-        asyncio.run(db.mark_pending_delivered("123", target_date, 7))
+        asyncio.run(db.mark_pending_delivered("123", target_date, 7, target_minute=0))
+        assert isinstance(fake_db.stores["pending_digests"][doc_id]["delivered_at"], datetime)
+
+    def test_pending_digest_minute_round_trip(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+        monkeypatch.setattr(db, "public_user_ref", lambda telegram_id: f"ref-{telegram_id}")
+        target_date = date(2026, 5, 4)
+
+        asyncio.run(db.save_pending_digest("123", target_date, 19, [{"article_id": "b1"}], target_minute=30))
+
+        doc_id = "ref-123_2026-05-04_1930"
+        assert fake_db.stores["pending_digests"][doc_id]["target_hour"] == 19
+        assert fake_db.stores["pending_digests"][doc_id]["target_minute"] == 30
+
+        pending = asyncio.run(db.get_pending_digest("123", target_date, 19, target_minute=30))
+        assert pending["articles"] == [{"article_id": "b1"}]
+
+        asyncio.run(db.mark_pending_delivered("123", target_date, 19, target_minute=30))
         assert isinstance(fake_db.stores["pending_digests"][doc_id]["delivered_at"], datetime)
 
 

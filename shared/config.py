@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     CURATED_TOPIC_TTL_SECONDS: int = 3600       # 1 hour
     ARTICLE_SUMMARY_TTL_SECONDS: int = 86400    # 24 hours
     PENDING_DIGEST_TTL_SECONDS: int = 86400     # 24 hours
+    PREPARE_BUFFER_MINUTES: int = 5
 
     # Concurrency caps
     NEWS_FETCH_CONCURRENCY: int = 5

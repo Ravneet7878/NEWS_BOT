@@ -247,6 +247,37 @@ async def get_active_users_for_hour(utc_hour: int) -> list[User]:
         raise
 
 
+async def get_active_users_for_window(utc_hours: list[int]) -> list[User]:
+    """
+    Return all active, non-paused users whose delivery_hour_utc is in utc_hours.
+
+    Used by /prepare's forward-looking window scan. The IN-query reuses the existing
+    composite index on (is_active, is_paused, delivery_hour_utc).
+    """
+    if not utc_hours:
+        return []
+    try:
+        query = (
+            _db.collection(_USERS_COL)
+            .where(filter=FieldFilter("is_active", "==", True))
+            .where(filter=FieldFilter("is_paused", "==", False))
+            .where(filter=FieldFilter("delivery_hour_utc", "in", utc_hours))
+        )
+        docs = query.stream()
+        users: list[User] = []
+        async for doc in docs:
+            try:
+                users.append(User(**doc.to_dict()))
+            except Exception as parse_exc:
+                logger.warning(
+                    "Skipping malformed user doc %s: %s", doc.id, parse_exc
+                )
+        return users
+    except Exception as exc:
+        logger.error("get_active_users_for_window(%s) failed: %s", utc_hours, exc, exc_info=True)
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Topic weights (learning signal)
 # ---------------------------------------------------------------------------
@@ -393,8 +424,8 @@ async def record_article_reaction(
 # ---------------------------------------------------------------------------
 
 
-def _pending_doc_id(telegram_id: str, target_date: date, target_hour: int) -> str:
-    return f"{public_user_ref(telegram_id)}_{target_date.isoformat()}_{target_hour:02d}"
+def _pending_doc_id(telegram_id: str, target_date: date, target_hour: int, target_minute: int = 0) -> str:
+    return f"{public_user_ref(telegram_id)}_{target_date.isoformat()}_{target_hour:02d}{target_minute:02d}"
 
 
 async def save_pending_digest(
@@ -402,15 +433,17 @@ async def save_pending_digest(
     target_date: date,
     target_hour: int,
     articles: list[dict],
+    target_minute: int = 0,
 ) -> None:
     """Persist a fully-built digest ready for Telegram delivery. Overwrites any existing doc."""
     try:
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(seconds=settings.PENDING_DIGEST_TTL_SECONDS)
-        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour, target_minute)
         payload = {
             "telegram_id": telegram_id,
             "target_hour": target_hour,
+            "target_minute": target_minute,
             "target_date": target_date.isoformat(),
             "articles": articles,
             "built_at": now,
@@ -432,10 +465,11 @@ async def get_pending_digest(
     telegram_id: str,
     target_date: date,
     target_hour: int,
+    target_minute: int = 0,
 ) -> dict | None:
     """Return a pending digest doc if present and unexpired, else None."""
     try:
-        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour, target_minute)
         doc = await _db.collection(_PENDING_COL).document(doc_id).get()
         if not doc.exists:
             return None
@@ -465,10 +499,11 @@ async def mark_pending_delivered(
     telegram_id: str,
     target_date: date,
     target_hour: int,
+    target_minute: int = 0,
 ) -> None:
     """Stamp delivered_at on the pending digest doc (does not delete it; TTL handles cleanup)."""
     try:
-        doc_id = _pending_doc_id(telegram_id, target_date, target_hour)
+        doc_id = _pending_doc_id(telegram_id, target_date, target_hour, target_minute)
         await _db.collection(_PENDING_COL).document(doc_id).update(
             {"delivered_at": datetime.now(timezone.utc)}
         )

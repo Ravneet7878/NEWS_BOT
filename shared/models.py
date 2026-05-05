@@ -23,6 +23,7 @@ class User(BaseModel):
     # Clamped [0.5, 3.0]; normalised so sum == len(topics)
     topic_weights: dict[str, float] = {}
     delivery_hour_utc: int = 1
+    delivery_minute_utc: int = 0
     delivery_tz: str = "Asia/Kolkata"
     onboarding_state: OnboardingState = OnboardingState.AWAITING_TOPICS
     created_at: datetime

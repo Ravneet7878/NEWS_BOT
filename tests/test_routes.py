@@ -101,10 +101,12 @@ class TestWorkerRoutes:
     def test_run_digests_prefetches_unique_topics_and_processes_users(self, monkeypatch) -> None:
         from worker import main
 
+        # Users have delivery_minute_utc=0 (default); pin utc_now to minute=0 so the filter passes.
         users = [
             make_user(telegram_id="1", topics=["Tech", "Finance"]),
             make_user(telegram_id="2", topics=["Tech"]),
         ]
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=users))
 
         async def fake_prefetch(topics, client):
@@ -136,8 +138,11 @@ class TestWorkerRoutes:
     def test_prepare_digests_builds_cached_topic_summaries_and_pending_docs(self, monkeypatch) -> None:
         from worker import main
 
-        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
-        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        # Pin utc_now to 12:00; window = 12:01–12:05. User slot = 12:01 → matches first slot.
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc))
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=12, delivery_minute_utc=1)
+        monkeypatch.setattr(main.db, "get_active_users_for_window", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
 
         class FakeClient:
             async def __aenter__(self):
@@ -181,10 +186,12 @@ class TestWorkerRoutes:
     def test_prepare_digests_targets_next_utc_day_before_midnight(self, monkeypatch) -> None:
         from worker import main
 
-        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
-        get_users = AsyncMock(return_value=[user])
+        # utc_now = 23:35 → window covers 23:36–23:40 UTC. User delivery slot = 23:36 (next day)
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=23, delivery_minute_utc=36)
         monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 23, 35, tzinfo=timezone.utc))
-        monkeypatch.setattr(main.db, "get_active_users_for_hour", get_users)
+        get_window = AsyncMock(return_value=[user])
+        monkeypatch.setattr(main.db, "get_active_users_for_window", get_window)
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
 
         class FakeClient:
             async def __aenter__(self):
@@ -219,16 +226,19 @@ class TestWorkerRoutes:
         result = asyncio.run(main.prepare_digests(object()))
 
         assert result["prepared"] == 1
-        get_users.assert_awaited_once_with(0)
+        get_window.assert_awaited_once_with([23])
         save_pending.assert_awaited_once()
-        assert save_pending.await_args.args[1] == date(2026, 5, 5)
-        assert save_pending.await_args.args[2] == 0
+        # slot 23:36 on 2026-05-04 (same day since cursor starts at 23:36)
+        assert save_pending.await_args.args[1] == date(2026, 5, 4)
+        assert save_pending.await_args.args[2] == 23
 
     def test_prepare_digests_uses_cache_hits(self, monkeypatch) -> None:
         from worker import main
 
-        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
-        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc))
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=12, delivery_minute_utc=1)
+        monkeypatch.setattr(main.db, "get_active_users_for_window", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
 
         class FakeClient:
             async def __aenter__(self):
@@ -261,6 +271,8 @@ class TestWorkerRoutes:
         from worker import main
 
         user = make_user(telegram_id="1", total_digests_sent=2)
+        # get_active_users_for_hour returns the user; delivery_minute_utc==0 matches minute 0
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": [{"article_id": "a1"}]}))
         monkeypatch.setattr(main, "send_digest_message", AsyncMock(return_value={"status": "delivered", "messages_sent": 1}))
@@ -289,6 +301,7 @@ class TestWorkerRoutes:
 
         user = make_user(telegram_id="1")
         process_user = AsyncMock()
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
         monkeypatch.setattr(main, "process_user", process_user)
@@ -307,11 +320,32 @@ class TestWorkerRoutes:
         }
         process_user.assert_not_awaited()
 
+    def test_deliver_digests_skips_users_whose_minute_does_not_match(self, monkeypatch) -> None:
+        from worker import main
+
+        # User delivery slot is :30 but deliver fires at :00 — should be a zero-op
+        user = make_user(telegram_id="1", delivery_minute_utc=30)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+
+        result = asyncio.run(main.deliver_digests(object()))
+
+        assert result == {
+            "users_total": 0,
+            "delivered": 0,
+            "already_delivered": 0,
+            "skipped_empty": 0,
+            "missing_pending": 0,
+            "errors": 0,
+        }
+
     def test_prepare_digests_skips_save_for_empty_digest(self, monkeypatch) -> None:
         from worker import main
 
-        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0})
-        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 12, 0, tzinfo=timezone.utc))
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=12, delivery_minute_utc=1)
+        monkeypatch.setattr(main.db, "get_active_users_for_window", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
 
         class FakeClient:
             async def __aenter__(self):
@@ -336,6 +370,7 @@ class TestWorkerRoutes:
         from worker import main
 
         user = make_user(telegram_id="1", total_digests_sent=5)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": []}))
         monkeypatch.setattr(
@@ -368,6 +403,7 @@ class TestWorkerRoutes:
         from worker import main
 
         user = make_user(telegram_id="1", total_digests_sent=3)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         # Pending digest exists but articles list is empty (e.g., /prepare saved before guard was added)
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value={"articles": []}))
@@ -398,6 +434,7 @@ class TestWorkerRoutes:
         from worker import main
 
         user = make_user(telegram_id="1", total_digests_sent=3)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
         monkeypatch.setattr(
             main.db,
@@ -442,9 +479,10 @@ class TestWorkerRoutes:
             "missing": None,
         }
 
-        async def fake_get_pending(telegram_id, target_date, target_hour):
+        async def fake_get_pending(telegram_id, target_date, target_hour, target_minute=0):
             return pending_by_user[telegram_id]
 
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc))
         monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=users))
         monkeypatch.setattr(main.db, "get_pending_digest", fake_get_pending)
         send_digest = AsyncMock(return_value={"status": "delivered", "messages_sent": 1})
@@ -475,3 +513,74 @@ class TestWorkerRoutes:
         assert update_user.await_args.kwargs["total_digests_sent"] == 2
         mark_delivered.assert_awaited_once()
         save_history.assert_awaited_once()
+
+    def test_prepare_digests_picks_up_user_after_time_change(self, monkeypatch) -> None:
+        from worker import main
+
+        # utc_now = 12:32 UTC, PREPARE_BUFFER_MINUTES=5 → window covers 12:33–12:37.
+        # User changed delivery slot to 12:35 after the 12:30 prepare already ran.
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=12, delivery_minute_utc=35)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 12, 32, tzinfo=timezone.utc))
+        monkeypatch.setattr(main.settings, "PREPARE_BUFFER_MINUTES", 5)
+        get_window = AsyncMock(return_value=[user])
+        monkeypatch.setattr(main.db, "get_active_users_for_window", get_window)
+        # No pending doc exists yet — must be built
+        monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return None
+
+        monkeypatch.setattr(main.httpx, "AsyncClient", lambda **kwargs: FakeClient())
+        monkeypatch.setattr(
+            main,
+            "prefetch_topic_news",
+            AsyncMock(return_value={"Tech": TopicResult("Tech", [cached_article("https://example.com/a")])}),
+        )
+        monkeypatch.setattr(main.llm_cache, "get_cached_curated_topic", AsyncMock(return_value=None))
+        monkeypatch.setattr(main.llm_cache, "set_cached_curated_topic", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "run_curator_for_topic",
+            AsyncMock(return_value=[{"article_id": "a1", "topic": "Tech", "url": "https://example.com/a", "relevance_score": 1.0}]),
+        )
+        monkeypatch.setattr(main.llm_cache, "get_cached_article_summary", AsyncMock(return_value=None))
+        monkeypatch.setattr(main.llm_cache, "set_cached_article_summary", AsyncMock())
+        monkeypatch.setattr(
+            main,
+            "run_summariser_for_article",
+            AsyncMock(return_value={"article_id": "a1", "summary_points": ["point"], "why_it_matters": "why"}),
+        )
+        save_pending = AsyncMock()
+        monkeypatch.setattr(main.db, "save_pending_digest", save_pending)
+
+        result = asyncio.run(main.prepare_digests(object()))
+
+        assert result["prepared"] == 1
+        save_pending.assert_awaited_once()
+        assert save_pending.await_args.args[2] == 12   # target_hour
+        assert save_pending.await_args.args[4] == 35   # target_minute
+
+    def test_prepare_digests_skips_user_with_existing_pending_doc(self, monkeypatch) -> None:
+        from worker import main
+
+        # Same setup as above, but get_pending_digest returns an existing doc — must NOT rebuild.
+        user = make_user(telegram_id="1", topics=["Tech"], topic_weights={"Tech": 1.0}, delivery_hour_utc=12, delivery_minute_utc=35)
+        monkeypatch.setattr(main, "utc_now", lambda: datetime(2026, 5, 4, 12, 32, tzinfo=timezone.utc))
+        monkeypatch.setattr(main.settings, "PREPARE_BUFFER_MINUTES", 5)
+        monkeypatch.setattr(main.db, "get_active_users_for_window", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(
+            main.db,
+            "get_pending_digest",
+            AsyncMock(return_value={"articles": [{"article_id": "a1"}]}),
+        )
+        save_pending = AsyncMock()
+        monkeypatch.setattr(main.db, "save_pending_digest", save_pending)
+
+        result = asyncio.run(main.prepare_digests(object()))
+
+        assert result["prepared"] == 0
+        save_pending.assert_not_awaited()

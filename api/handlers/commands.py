@@ -6,7 +6,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 import shared.database as db
-from api.handlers.onboarding import _parse_hour, _local_to_utc_hour
+from api.handlers.onboarding import _parse_time, _local_to_utc_hm
 from shared.config import settings
 from shared.models import OnboardingState
 from utils.guardrails import sanitize_topics
@@ -130,15 +130,15 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        parsed = _parse_hour(raw)
+        parsed = _parse_time(raw)
         if parsed is None:
             await update.message.reply_text(
                 "I couldn't understand that time. Try: 7am  |  19:00  |  7am IST  |  9pm EST"
             )
             return
 
-        local_hour, tz_name = parsed
-        utc_hour = _local_to_utc_hour(local_hour, tz_name)
+        local_hour, local_minute, tz_name = parsed
+        utc_hour, utc_minute = _local_to_utc_hm(local_hour, local_minute, tz_name)
 
         user = await db.get_user(telegram_id)
         assert user is not None
@@ -147,9 +147,15 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not user.is_active and user.topics:
             extra = {"is_active": True, "onboarding_state": OnboardingState.DONE}
 
-        await db.update_user(telegram_id, delivery_hour_utc=utc_hour, delivery_tz=tz_name, **extra)
+        await db.update_user(
+            telegram_id,
+            delivery_hour_utc=utc_hour,
+            delivery_minute_utc=utc_minute,
+            delivery_tz=tz_name,
+            **extra,
+        )
         await update.message.reply_text(
-            f"Delivery time updated to {local_hour:02d}:00 {tz_name} (UTC {utc_hour:02d}:00). ✅"
+            f"Delivery time updated to {local_hour:02d}:{local_minute:02d} {tz_name} (UTC {utc_hour:02d}:{utc_minute:02d}). ✅"
         )
     except Exception as exc:
         logger.error("handle_time(%s) failed: %s", public_user_ref(telegram_id), exc, exc_info=True)
@@ -178,9 +184,9 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         except ZoneInfoNotFoundError:
             tz = ZoneInfo("UTC")
 
-        # Convert stored UTC delivery hour back to local for display
+        # Convert stored UTC delivery hour+minute back to local for display
         utc_delivery = utc_now().replace(
-            hour=user.delivery_hour_utc, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo("UTC")
+            hour=user.delivery_hour_utc, minute=user.delivery_minute_utc, second=0, microsecond=0, tzinfo=ZoneInfo("UTC")
         )
         local_delivery = utc_delivery.astimezone(tz)
         delivery_display = local_delivery.strftime("%I:%M %p") + f" {user.delivery_tz}"

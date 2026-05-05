@@ -46,16 +46,17 @@ _TIME_PATTERN = re.compile(
 )
 
 
-def _parse_hour(text: str) -> tuple[int, str] | None:
+def _parse_time(text: str) -> tuple[int, int, str] | None:
     """
-    Parse a time string and return (local_hour_24, tz_name) or None on failure.
-    Accepts: "7", "7am", "7:00", "7:00 AM", "19:00", "7am IST"
+    Parse a time string and return (local_hour_24, local_minute, tz_name) or None on failure.
+    Accepts: "7", "7am", "7:00", "7:00 AM", "19:00", "7am IST", "8:30 PM EST"
     """
     match = _TIME_PATTERN.match(text.strip())
     if not match:
         return None
 
     hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
     ampm = (match.group(3) or "").lower()
     tz_abbr = (match.group(4) or "").upper()
 
@@ -68,20 +69,35 @@ def _parse_hour(text: str) -> tuple[int, str] | None:
         return None
 
     tz_name = _TZ_ABBREVIATIONS.get(tz_abbr, "Asia/Kolkata")
-    return hour, tz_name
+    return hour, minute, tz_name
 
 
-def _local_to_utc_hour(local_hour: int, tz_name: str) -> int:
-    """Convert a local hour to UTC using zoneinfo (Python 3.12 built-in)."""
+def _local_to_utc_hm(local_hour: int, local_minute: int, tz_name: str) -> tuple[int, int]:
+    """Convert a local hour+minute to UTC, returning (utc_hour, utc_minute)."""
     try:
         tz = ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
         tz = ZoneInfo("Asia/Kolkata")
 
     now = datetime.now(tz=tz)
-    local_dt = now.replace(hour=local_hour, minute=0, second=0, microsecond=0)
+    local_dt = now.replace(hour=local_hour, minute=local_minute, second=0, microsecond=0)
     utc_dt = local_dt.astimezone(ZoneInfo("UTC"))
-    return utc_dt.hour
+    return utc_dt.hour, utc_dt.minute
+
+
+# Keep legacy single-value shims so any callers that have not yet been updated
+# (e.g. existing tests) continue to work during the transition.
+def _parse_hour(text: str) -> tuple[int, str] | None:
+    result = _parse_time(text)
+    if result is None:
+        return None
+    hour, _minute, tz_name = result
+    return hour, tz_name
+
+
+def _local_to_utc_hour(local_hour: int, tz_name: str) -> int:
+    utc_hour, _utc_minute = _local_to_utc_hm(local_hour, 0, tz_name)
+    return utc_hour
 
 
 # ---------------------------------------------------------------------------
@@ -225,7 +241,7 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     try:
         raw = update.message.text.strip()
-        parsed = _parse_hour(raw)
+        parsed = _parse_time(raw)
 
         if parsed is None:
             await update.message.reply_text(
@@ -234,12 +250,13 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             )
             return AWAITING_TIME
 
-        local_hour, tz_name = parsed
-        utc_hour = _local_to_utc_hour(local_hour, tz_name)
+        local_hour, local_minute, tz_name = parsed
+        utc_hour, utc_minute = _local_to_utc_hm(local_hour, local_minute, tz_name)
 
         await db.update_user(
             telegram_id,
             delivery_hour_utc=utc_hour,
+            delivery_minute_utc=utc_minute,
             delivery_tz=tz_name,
             is_active=True,
             onboarding_state=OnboardingState.DONE,
@@ -247,7 +264,7 @@ async def handle_time_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         await update.message.reply_text(
             f"All set! ✅\n\n"
-            f"Delivery time: {local_hour:02d}:00 {tz_name} (UTC {utc_hour:02d}:00)\n\n"
+            f"Delivery time: {local_hour:02d}:{local_minute:02d} {tz_name} (UTC {utc_hour:02d}:{utc_minute:02d})\n\n"
             "Your first digest will arrive at the scheduled time.\n"
             "Use /help to see all available commands."
         )

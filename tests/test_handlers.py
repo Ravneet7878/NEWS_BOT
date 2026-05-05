@@ -25,6 +25,22 @@ class TestOnboardingHelpers:
         assert onboarding._parse_hour("24:00") is None
         assert onboarding._parse_hour("nope") is None
 
+    def test_parse_time_returns_minute_component(self) -> None:
+        from api.handlers import onboarding
+
+        assert onboarding._parse_time("7") == (7, 0, "Asia/Kolkata")
+        assert onboarding._parse_time("7am IST") == (7, 0, "Asia/Kolkata")
+        assert onboarding._parse_time("8:30 PM EST") == (20, 30, "America/New_York")
+        assert onboarding._parse_time("1:00 AM IST") == (1, 0, "Asia/Kolkata")
+        assert onboarding._parse_time("nope") is None
+
+    def test_local_to_utc_hm_ist_offset(self) -> None:
+        from api.handlers import onboarding
+
+        utc_hour, utc_minute = onboarding._local_to_utc_hm(1, 0, "Asia/Kolkata")
+        assert utc_hour == 19
+        assert utc_minute == 30
+
     def test_local_to_utc_hour_falls_back_for_unknown_timezone(self) -> None:
         from api.handlers import onboarding
 
@@ -138,6 +154,7 @@ class TestOnboardingHandlers:
         assert asyncio.run(onboarding.handle_time_input(good, fake_context())) == ConversationHandler.END
         update_user.assert_awaited_once()
         assert update_user.await_args.kwargs["delivery_hour_utc"] == 7
+        assert update_user.await_args.kwargs["delivery_minute_utc"] == 0
         assert update_user.await_args.kwargs["delivery_tz"] == "UTC"
         assert update_user.await_args.kwargs["is_active"] is True
 
@@ -210,6 +227,7 @@ class TestUserCommands:
         asyncio.run(commands.handle_time(update, fake_context("7am", "UTC")))
 
         assert update_user.await_args.kwargs["delivery_hour_utc"] == 7
+        assert update_user.await_args.kwargs["delivery_minute_utc"] == 0
         assert update_user.await_args.kwargs["is_active"] is True
         assert update_user.await_args.kwargs["onboarding_state"] == OnboardingState.DONE
 
