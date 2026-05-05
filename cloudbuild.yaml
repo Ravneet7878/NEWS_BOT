@@ -4,11 +4,11 @@ steps:
     args:
       - build
       - --build-arg=SERVICE=api
-      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA
+      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$_COMMIT_SHA
       - .
 
   - name: gcr.io/cloud-builders/docker
-    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA]
+    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$_COMMIT_SHA]
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
@@ -16,7 +16,7 @@ steps:
       - run
       - deploy
       - news-bot-api
-      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$COMMIT_SHA
+      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-api:$_COMMIT_SHA
       - --region=asia-south1
       - --service-account=news-bot-api-sa@$PROJECT_ID.iam.gserviceaccount.com
       - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1,APP_ENV=prod
@@ -30,11 +30,11 @@ steps:
     args:
       - build
       - --build-arg=SERVICE=worker
-      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA
+      - -t=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$_COMMIT_SHA
       - .
 
   - name: gcr.io/cloud-builders/docker
-    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA]
+    args: [push, asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$_COMMIT_SHA]
 
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk
     entrypoint: gcloud
@@ -42,7 +42,7 @@ steps:
       - run
       - deploy
       - news-bot-worker
-      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$COMMIT_SHA
+      - --image=asia-south1-docker.pkg.dev/$PROJECT_ID/news-bot-repo/news-bot-worker:$_COMMIT_SHA
       - --region=asia-south1
       - --service-account=news-bot-worker-sa@$PROJECT_ID.iam.gserviceaccount.com
       - --set-env-vars=GCP_PROJECT_ID=$PROJECT_ID,VERTEX_AI_LOCATION=asia-south1,APP_ENV=prod,GOOGLE_GENAI_USE_VERTEXAI=1,GOOGLE_CLOUD_PROJECT=$PROJECT_ID,GOOGLE_CLOUD_LOCATION=asia-south1
@@ -54,7 +54,7 @@ steps:
       - --concurrency=1
 
 substitutions:
-  COMMIT_SHA: manual
+  _COMMIT_SHA: manual
 
 options:
   logging: CLOUD_LOGGING_ONLY
