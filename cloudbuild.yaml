@@ -52,3 +52,9 @@ steps:
       - --max-instances=2
       - --timeout=1800
       - --concurrency=1
+
+substitutions:
+  COMMIT_SHA: manual
+
+options:
+  logging: CLOUD_LOGGING_ONLY
