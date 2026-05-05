@@ -225,12 +225,19 @@ class TestWorkerRoutes:
 
         result = asyncio.run(main.deliver_digests(object()))
 
-        assert result == {"delivered": 1, "errors": 0}
+        assert result == {
+            "users_total": 1,
+            "delivered": 1,
+            "already_delivered": 0,
+            "skipped_empty": 0,
+            "missing_pending": 0,
+            "errors": 0,
+        }
         update_user.assert_awaited_once()
         assert update_user.await_args.kwargs["total_digests_sent"] == 3
         mark_delivered.assert_awaited_once()
 
-    def test_deliver_digests_falls_back_to_live_pipeline_when_pending_missing(self, monkeypatch) -> None:
+    def test_deliver_digests_returns_retryable_error_when_pending_missing(self, monkeypatch) -> None:
         from worker import main
 
         user = make_user(telegram_id="1")
@@ -239,10 +246,19 @@ class TestWorkerRoutes:
         monkeypatch.setattr(main.db, "get_pending_digest", AsyncMock(return_value=None))
         monkeypatch.setattr(main, "process_user", process_user)
 
-        result = asyncio.run(main.deliver_digests(object()))
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(main.deliver_digests(object()))
 
-        assert result == {"delivered": 1, "errors": 0}
-        process_user.assert_awaited_once_with(user, prefetched={})
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == {
+            "users_total": 1,
+            "delivered": 0,
+            "already_delivered": 0,
+            "skipped_empty": 0,
+            "missing_pending": 1,
+            "errors": 0,
+        }
+        process_user.assert_not_awaited()
 
     def test_prepare_digests_skips_save_for_empty_digest(self, monkeypatch) -> None:
         from worker import main
@@ -289,7 +305,14 @@ class TestWorkerRoutes:
 
         result = asyncio.run(main.deliver_digests(object()))
 
-        assert result == {"delivered": 1, "errors": 0}
+        assert result == {
+            "users_total": 1,
+            "delivered": 0,
+            "already_delivered": 0,
+            "skipped_empty": 1,
+            "missing_pending": 0,
+            "errors": 0,
+        }
         update_user.assert_not_awaited()
         mark_delivered.assert_not_awaited()
         save_history.assert_not_awaited()
@@ -311,7 +334,97 @@ class TestWorkerRoutes:
         monkeypatch.setattr(main.db, "mark_pending_delivered", AsyncMock())
         monkeypatch.setattr(main.db, "save_user_digest_history", AsyncMock())
 
-        asyncio.run(main.deliver_digests(object()))
+        result = asyncio.run(main.deliver_digests(object()))
 
+        assert result == {
+            "users_total": 1,
+            "delivered": 0,
+            "already_delivered": 0,
+            "skipped_empty": 1,
+            "missing_pending": 0,
+            "errors": 0,
+        }
         update_user.assert_not_awaited()
         assert user.total_digests_sent == 3
+
+    def test_deliver_digests_skips_already_delivered_pending_digest(self, monkeypatch) -> None:
+        from worker import main
+
+        user = make_user(telegram_id="1", total_digests_sent=3)
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=[user]))
+        monkeypatch.setattr(
+            main.db,
+            "get_pending_digest",
+            AsyncMock(return_value={"articles": [{"article_id": "a1"}], "delivered_at": "done"}),
+        )
+        send_digest = AsyncMock()
+        update_user = AsyncMock()
+        mark_delivered = AsyncMock()
+        save_history = AsyncMock()
+        monkeypatch.setattr(main, "send_digest_message", send_digest)
+        monkeypatch.setattr(main.db, "update_user", update_user)
+        monkeypatch.setattr(main.db, "mark_pending_delivered", mark_delivered)
+        monkeypatch.setattr(main.db, "save_user_digest_history", save_history)
+
+        result = asyncio.run(main.deliver_digests(object()))
+
+        assert result == {
+            "users_total": 1,
+            "delivered": 0,
+            "already_delivered": 1,
+            "skipped_empty": 0,
+            "missing_pending": 0,
+            "errors": 0,
+        }
+        send_digest.assert_not_awaited()
+        update_user.assert_not_awaited()
+        mark_delivered.assert_not_awaited()
+        save_history.assert_not_awaited()
+
+    def test_deliver_digests_mixed_results_raise_retryable_for_missing_pending(self, monkeypatch) -> None:
+        from worker import main
+
+        users = [
+            make_user(telegram_id="delivered", total_digests_sent=1),
+            make_user(telegram_id="already", total_digests_sent=2),
+            make_user(telegram_id="missing", total_digests_sent=3),
+        ]
+        pending_by_user = {
+            "delivered": {"articles": [{"article_id": "a1"}]},
+            "already": {"articles": [{"article_id": "a2"}], "delivered_at": "done"},
+            "missing": None,
+        }
+
+        async def fake_get_pending(telegram_id, target_date, target_hour):
+            return pending_by_user[telegram_id]
+
+        monkeypatch.setattr(main.db, "get_active_users_for_hour", AsyncMock(return_value=users))
+        monkeypatch.setattr(main.db, "get_pending_digest", fake_get_pending)
+        send_digest = AsyncMock(return_value={"status": "delivered", "messages_sent": 1})
+        update_user = AsyncMock()
+        mark_delivered = AsyncMock()
+        save_history = AsyncMock()
+        monkeypatch.setattr(main, "send_digest_message", send_digest)
+        monkeypatch.setattr(main.db, "update_user", update_user)
+        monkeypatch.setattr(main.db, "mark_pending_delivered", mark_delivered)
+        monkeypatch.setattr(main.db, "save_user_digest_history", save_history)
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(main.deliver_digests(object()))
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail == {
+            "users_total": 3,
+            "delivered": 1,
+            "already_delivered": 1,
+            "skipped_empty": 0,
+            "missing_pending": 1,
+            "errors": 0,
+        }
+        send_digest.assert_awaited_once()
+        assert send_digest.await_args.args[0] == "delivered"
+        update_user.assert_awaited_once()
+        assert update_user.await_args.args[0] == "delivered"
+        assert update_user.await_args.kwargs["total_digests_sent"] == 2
+        mark_delivered.assert_awaited_once()
+        save_history.assert_awaited_once()

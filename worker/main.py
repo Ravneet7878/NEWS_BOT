@@ -845,7 +845,8 @@ async def prepare_digests(request: Request) -> dict:
 async def deliver_digests(request: Request) -> dict:
     """Deliver pre-built digests from pending_digests. No LLM calls.
 
-    Falls back to the legacy live pipeline (/run logic) if /prepare didn't run.
+    If /prepare has not produced a pending digest yet, return a retryable 503 so
+    Cloud Scheduler can retry. Use /run for manual live recovery.
     """
     now = utc_now()
     target_hour = now.hour
@@ -859,20 +860,33 @@ async def deliver_digests(request: Request) -> dict:
 
     if not users:
         logger.info("deliver_digests: no users for UTC hour %d", target_hour)
-        return {"delivered": 0}
+        return {
+            "users_total": 0,
+            "delivered": 0,
+            "already_delivered": 0,
+            "skipped_empty": 0,
+            "missing_pending": 0,
+            "errors": 0,
+        }
 
     sem = asyncio.Semaphore(settings.USER_PROCESS_CONCURRENCY)
 
-    async def _deliver_one(user: User) -> None:
+    async def _deliver_one(user: User) -> str:
         async with sem:
             pending = await db.get_pending_digest(user.telegram_id, target_date, target_hour)
             if pending is None:
                 logger.warning(
-                    "deliver_digests: no pending digest for %s — falling back to live pipeline",
+                    "deliver_digests: no pending digest for %s — waiting for Scheduler retry",
                     public_user_ref(user.telegram_id),
                 )
-                await process_user(user, prefetched={})
-                return
+                return "missing_pending"
+
+            if pending.get("delivered_at") is not None:
+                logger.info(
+                    "deliver_digests: digest already delivered for %s — skipping resend",
+                    public_user_ref(user.telegram_id),
+                )
+                return "already_delivered"
 
             articles_json = json.dumps(pending.get("articles", []))
             # Raises on Telegram failure — Firestore writes only happen after confirmed delivery.
@@ -882,7 +896,7 @@ async def deliver_digests(request: Request) -> dict:
                     "deliver_digests: 0 messages sent for %s (empty digest) — skipping state update",
                     public_user_ref(user.telegram_id),
                 )
-                return
+                return "skipped_empty"
             sent_at = utc_now()
             await db.mark_pending_delivered(user.telegram_id, target_date, target_hour)
             await db.update_user(
@@ -900,19 +914,47 @@ async def deliver_digests(request: Request) -> dict:
                     public_user_ref(user.telegram_id), hist_exc, exc_info=True,
                 )
             logger.info("deliver_digests: delivered to %s", public_user_ref(user.telegram_id))
+            return "delivered"
 
     results = await asyncio.gather(*[_deliver_one(u) for u in users], return_exceptions=True)
-    error_count = sum(1 for r in results if isinstance(r, BaseException))
+    stats = {
+        "users_total": len(users),
+        "delivered": 0,
+        "already_delivered": 0,
+        "skipped_empty": 0,
+        "missing_pending": 0,
+        "errors": 0,
+    }
+    for result in results:
+        if isinstance(result, BaseException):
+            stats["errors"] += 1
+            continue
+        if result in stats:
+            stats[result] += 1
+        else:
+            stats["errors"] += 1
+
     logger.info(
-        "deliver_digests complete: delivered=%d errors=%d (UTC hour %d)",
-        len(users), error_count, target_hour,
+        (
+            "deliver_digests complete: users=%d delivered=%d already_delivered=%d "
+            "skipped_empty=%d missing_pending=%d errors=%d (UTC hour %d)"
+        ),
+        stats["users_total"],
+        stats["delivered"],
+        stats["already_delivered"],
+        stats["skipped_empty"],
+        stats["missing_pending"],
+        stats["errors"],
+        target_hour,
     )
-    if error_count > 0:
+    if stats["missing_pending"] > 0:
+        raise HTTPException(status_code=503, detail=stats)
+    if stats["errors"] > 0:
         raise HTTPException(
             status_code=500,
-            detail=f"deliver_digests: {error_count}/{len(users)} users failed (UTC hour {target_hour})",
+            detail=stats,
         )
-    return {"delivered": len(users), "errors": 0}
+    return stats
 
 
 @app.post("/run")

@@ -23,7 +23,7 @@ The `api` service handles real-time Telegram webhook events and must respond wit
 
 **Worker scheduling (two-job flow):**
 1. At `:55` — Cloud Scheduler calls `POST /prepare`: runs the ADK pipeline (curator + summariser) for all users scheduled for the next hour and caches results in `pending_digests`.
-2. At `:00` — Cloud Scheduler calls `POST /deliver`: reads pre-built digests from `pending_digests` and sends them via Telegram. Falls back to the live pipeline (`/run` logic) if `/prepare` didn't complete.
+2. At `:00` — Cloud Scheduler calls `POST /deliver`: reads pre-built digests from `pending_digests` and sends them via Telegram. If `/prepare` is still running or a pending digest is missing, `/deliver` returns a retryable `503` so Scheduler retries within the hour. Use `POST /run` only for manual live recovery.
 
 **Data flow:**
 1. `api` receives `/start <code>` → validates invite (transactionally) → creates user in Firestore
@@ -173,6 +173,10 @@ PROJECT_ID=$PROJECT_ID ./scripts/setup_webhook.sh
 # Create Cloud Scheduler jobs (two-job flow: /prepare at :55, /deliver at :00)
 PROJECT_ID=$PROJECT_ID ./scripts/create_scheduler.sh
 ```
+
+The `news-bot-hourly-deliver` job is configured with retries bounded inside the
+same UTC hour. Do not rely on Cloud Run request queuing between `/prepare` and
+`/deliver`; missing pending digests are surfaced as retryable delivery attempts.
 
 ### Verify the deployment
 

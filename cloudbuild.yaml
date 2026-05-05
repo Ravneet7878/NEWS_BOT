@@ -49,6 +49,6 @@ steps:
       - --set-secrets=TELEGRAM_BOT_TOKEN=TELEGRAM_BOT_TOKEN:latest,NEWSDATA_API_KEY=NEWSDATA_API_KEY:latest,LOG_PSEUDONYM_SALT=log-pseudonym-salt:latest
       - --no-allow-unauthenticated
       - --memory=1Gi
-      - --max-instances=1
+      - --max-instances=2
       - --timeout=1800
       - --concurrency=1

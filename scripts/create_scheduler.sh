@@ -2,7 +2,7 @@
 # Run once after the worker Cloud Run service is deployed.
 # Creates two hourly jobs:
 #   - /prepare  at :55 (pre-builds digests before the hour)
-#   - /deliver  at :00 (delivers pre-built digests; falls back to live pipeline)
+#   - /deliver  at :00 (delivers pre-built digests; retries if /prepare is still running)
 #
 # Prerequisites:
 #   Grant the worker SA invoke rights on the worker service:
@@ -38,11 +38,16 @@ gcloud scheduler jobs create http news-bot-hourly-deliver \
   --http-method=POST \
   --oidc-service-account-email="$SCHEDULER_SA" \
   --oidc-token-audience="${WORKER_URL}" \
-  --time-zone="UTC"
+  --time-zone="UTC" \
+  --attempt-deadline=180s \
+  --max-retry-attempts=5 \
+  --min-backoff=300s \
+  --max-backoff=600s \
+  --max-doublings=1
 
 echo "Scheduler jobs created:"
 echo "  news-bot-hourly-prepare  → ${WORKER_URL}/prepare  (55 * * * * UTC)"
-echo "  news-bot-hourly-deliver  → ${WORKER_URL}/deliver  (0 * * * * UTC)"
+echo "  news-bot-hourly-deliver  → ${WORKER_URL}/deliver  (0 * * * * UTC, retries within the hour)"
 echo ""
 echo "Force a test run with:"
 echo "  gcloud scheduler jobs run news-bot-hourly-prepare --location=${REGION} --project=${PROJECT_ID}"
