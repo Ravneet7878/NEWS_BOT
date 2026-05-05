@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import httpx
 import vertexai  # type: ignore[import-untyped]
@@ -21,6 +21,7 @@ from shared.models import User
 from utils.guardrails import validate_curated_articles, validate_final_digest
 from utils.logging import get_logger, setup_logging
 from utils.privacy import public_user_ref
+from utils.time import utc_now
 from worker.pipeline.curator import curator_agent
 from worker.pipeline.fetcher import fetch_articles_for_user
 from worker.pipeline import llm_cache
@@ -353,6 +354,31 @@ async def summarise_in_batches(weighted: list[dict], user_ref: str) -> list[dict
 async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
     """Run the full pipeline for a single user and deliver the digest."""
     try:
+        _today = utc_now().date()
+        _utc_hour = utc_now().hour
+        _pending = await db.get_pending_digest(user.telegram_id, _today, _utc_hour)
+        if _pending:
+            _pending_articles = _pending.get("articles") or []
+            if _pending.get("delivered_at") is not None:
+                logger.info(
+                    "process_user: digest already delivered for user %s hour %d — skipping",
+                    public_user_ref(user.telegram_id), _utc_hour,
+                )
+                return
+            if _pending_articles:
+                logger.info(
+                    "process_user: pending digest HIT for user %s hour %d — skipping LLM pipeline",
+                    public_user_ref(user.telegram_id), _utc_hour,
+                )
+                await send_digest_message(user.telegram_id, json.dumps(_pending_articles))
+                await db.mark_pending_delivered(user.telegram_id, _today, _utc_hour)
+                await db.update_user(
+                    user.telegram_id,
+                    last_digest_sent=utc_now(),
+                    total_digests_sent=user.total_digests_sent + 1,
+                )
+                return
+
         prefs = await get_user_preferences(user.telegram_id)
 
         # 1. Per-user assembly from prefetched topic data
@@ -409,9 +435,23 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
             parsed_curated = await _with_llm_retry(_run_curator)
         if not parsed_curated:
             logger.warning(
-                "Curator still empty after retry for user %s — proceeding with no curated articles",
+                "Curator still empty after retry for user %s — falling back to raw articles",
                 public_user_ref(user.telegram_id),
             )
+            sorted_raw = sorted(raw_articles_list, key=lambda a: a.get("published_at", ""), reverse=True)
+            parsed_curated = [
+                {
+                    "article_id": a.get("article_id", ""),
+                    "title": a.get("title", ""),
+                    "url": "",
+                    "summary": a.get("snippet", a.get("summary", "")),
+                    "topic": a.get("topic", ""),
+                    "relevance_score": 0.5,
+                    "source": a.get("source", a.get("source_name", "")),
+                    "published_at": a.get("published_at", a.get("pub_date", "")),
+                }
+                for a in sorted_raw[: settings.DIGEST_MAX_ARTICLES * 2]
+            ]
         curated = _normalize_articles(parsed_curated)
         curated = validate_curated_articles(curated, valid_ids, prefs.get("topics", []))
         logger.info("Curated articles after validation: %d for user %s", len(curated), _user_ref)
@@ -491,7 +531,16 @@ async def process_user(user: User, prefetched: dict[str, TopicResult]) -> None:
             len(final_digest_json),
         )
         await send_digest_message(user.telegram_id, final_digest_json)
-        sent_at = datetime.utcnow()
+        try:
+            _final_articles = _normalize_articles(json.loads(final_digest_json))
+            await db.save_pending_digest(user.telegram_id, _today, _utc_hour, _final_articles)
+            await db.mark_pending_delivered(user.telegram_id, _today, _utc_hour)
+        except Exception as _cache_exc:
+            logger.warning(
+                "Failed to cache pending digest for user %s: %s",
+                public_user_ref(user.telegram_id), _cache_exc,
+            )
+        sent_at = utc_now()
         await db.update_user(
             user.telegram_id,
             last_digest_sent=sent_at,
@@ -677,7 +726,7 @@ async def prepare_digests(request: Request) -> dict:
     using Firestore caches to skip repeated LLM calls. Stores results in pending_digests
     so /deliver can send them without any LLM work.
     """
-    now = datetime.utcnow()
+    now = utc_now()
     target_hour = (now.hour + 1) % 24
     target_date = (now + timedelta(minutes=10)).date()
 
@@ -777,7 +826,7 @@ async def deliver_digests(request: Request) -> dict:
 
     Falls back to the legacy live pipeline (/run logic) if /prepare didn't run.
     """
-    now = datetime.utcnow()
+    now = utc_now()
     target_hour = now.hour
     target_date = now.date()
 
@@ -806,7 +855,7 @@ async def deliver_digests(request: Request) -> dict:
 
             articles_json = json.dumps(pending.get("articles", []))
             await send_digest_message(user.telegram_id, articles_json)
-            sent_at = datetime.utcnow()
+            sent_at = utc_now()
             try:
                 await db.save_user_digest_history(
                     user.telegram_id, pending.get("articles", []), sent_at
@@ -839,7 +888,7 @@ async def run_digests(request: Request) -> dict:
     Trigger hourly digest delivery.
     Authentication is handled by Cloud Run IAM (OIDC via Cloud Scheduler).
     """
-    utc_hour = datetime.utcnow().hour
+    utc_hour = utc_now().hour
     try:
         users = await db.get_active_users_for_hour(utc_hour)
     except Exception as exc:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -53,15 +53,15 @@ class TestOnboardingHandlers:
         assert asyncio.run(onboarding.handle_start(update, fake_context("BAD"))) == ConversationHandler.END
         assert "doesn't exist" in update.message.replies[-1]["text"]
 
-        invite = InviteCode(code="USED", is_used=True, used_by="999", created_at=datetime.utcnow())
+        invite = InviteCode(code="USED", is_used=True, used_by="999", created_at=datetime.now(timezone.utc))
         monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=invite))
         assert asyncio.run(onboarding.handle_start(update, fake_context("USED"))) == ConversationHandler.END
         assert "already been used" in update.message.replies[-1]["text"]
 
         expired = InviteCode(
             code="OLD",
-            created_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() - timedelta(days=1),
+            created_at=datetime.now(timezone.utc),
+            expires_at=datetime.now(timezone.utc) - timedelta(days=1),
         )
         monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=expired))
         assert asyncio.run(onboarding.handle_start(update, fake_context("OLD"))) == ConversationHandler.END
@@ -72,7 +72,7 @@ class TestOnboardingHandlers:
 
         create_user = AsyncMock()
         mark_code_used = AsyncMock()
-        invite = InviteCode(code="JOIN", created_at=datetime.utcnow())
+        invite = InviteCode(code="JOIN", created_at=datetime.now(timezone.utc))
         monkeypatch.setattr(onboarding.db, "get_user", AsyncMock(return_value=None))
         monkeypatch.setattr(onboarding.db, "get_invite_code", AsyncMock(return_value=invite))
         monkeypatch.setattr(onboarding.db, "create_user", create_user)
@@ -216,7 +216,7 @@ class TestUserCommands:
     def test_status_formats_user_settings_and_help_replies(self, monkeypatch) -> None:
         from api.handlers import commands
 
-        user = make_user(last_digest_sent=datetime(2026, 5, 4, 1, 0), total_digests_sent=3)
+        user = make_user(last_digest_sent=datetime(2026, 5, 4, 1, 0, tzinfo=timezone.utc), total_digests_sent=3)
         monkeypatch.setattr(commands.db, "get_user", AsyncMock(return_value=user))
 
         status = FakeUpdate(user_id=123)

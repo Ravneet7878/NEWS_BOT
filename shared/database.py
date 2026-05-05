@@ -9,6 +9,7 @@ from shared.config import settings
 from shared.models import InviteCode, OnboardingState, User
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
+from utils.time import utc_now
 
 logger = get_logger(__name__)
 
@@ -91,7 +92,7 @@ async def mark_code_used(code: str, used_by: str) -> None:
             {
                 "is_used": True,
                 "used_by": used_by,
-                "used_at": datetime.utcnow(),
+                "used_at": utc_now(),
             }
         )
     except Exception as exc:
@@ -102,7 +103,7 @@ async def mark_code_used(code: str, used_by: str) -> None:
 async def create_invite_code(code: str) -> None:
     """Persist a new invite code document."""
     try:
-        invite = InviteCode(code=code, created_at=datetime.utcnow())
+        invite = InviteCode(code=code, created_at=utc_now())
         await _db.collection(_INVITE_CODES_COL).document(code).set(
             invite.model_dump(mode="json")
         )

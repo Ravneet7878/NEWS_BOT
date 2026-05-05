@@ -13,6 +13,7 @@ from shared.models import OnboardingState, User
 from utils.guardrails import sanitize_topics
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
+from utils.time import as_aware_utc, utc_now
 
 logger = get_logger(__name__)
 
@@ -125,7 +126,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             await update.message.reply_text("That invite code has already been used.")
             return ConversationHandler.END
 
-        if invite.expires_at and invite.expires_at < datetime.utcnow():
+        if invite.expires_at and as_aware_utc(invite.expires_at) < utc_now():
             await update.message.reply_text("That invite code has expired.")
             return ConversationHandler.END
 
@@ -135,7 +136,7 @@ async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                 first_name=update.effective_user.first_name or "User",
                 username=update.effective_user.username,
                 invite_code_used=code,
-                created_at=datetime.utcnow(),
+                created_at=utc_now(),
                 onboarding_state=OnboardingState.AWAITING_TOPICS,
             )
             await db.create_user(new_user)

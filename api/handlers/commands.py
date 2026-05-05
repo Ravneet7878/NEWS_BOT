@@ -1,6 +1,5 @@
 """PTB command handlers for registered users."""
 
-from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from telegram import Update
@@ -13,6 +12,7 @@ from shared.models import OnboardingState
 from utils.guardrails import sanitize_topics
 from utils.logging import get_logger
 from utils.privacy import public_user_ref
+from utils.time import utc_now
 
 logger = get_logger(__name__)
 
@@ -179,7 +179,7 @@ async def handle_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             tz = ZoneInfo("UTC")
 
         # Convert stored UTC delivery hour back to local for display
-        utc_delivery = datetime.utcnow().replace(
+        utc_delivery = utc_now().replace(
             hour=user.delivery_hour_utc, minute=0, second=0, microsecond=0, tzinfo=ZoneInfo("UTC")
         )
         local_delivery = utc_delivery.astimezone(tz)

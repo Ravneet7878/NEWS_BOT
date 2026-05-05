@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
@@ -20,6 +21,34 @@ os.environ.setdefault("WEBHOOK_SECRET_TOKEN", "secret")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "123456:test-token")
 os.environ.setdefault("NEWSDATA_API_KEY", "news-key")
 os.environ.setdefault("LOG_PSEUDONYM_SALT", "test-salt")
+
+
+def _filter_known_dependency_warnings() -> None:
+    """Hide only known dependency import warnings, even when pytest runs with -W default."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"authlib\.jose module is deprecated, please use joserfc instead\.",
+        category=Warning,
+        module=r"authlib\._joserfc_helpers",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"\[EXPERIMENTAL\] feature FeatureName\.PLUGGABLE_AUTH is enabled\.",
+        category=UserWarning,
+        module=r"google\.adk\.features\._feature_decorator",
+    )
+
+
+def pytest_configure() -> None:
+    _filter_known_dependency_warnings()
+
+
+_filter_known_dependency_warnings()
+
+
+@pytest.fixture(autouse=True)
+def known_dependency_warning_filters():
+    _filter_known_dependency_warnings()
 
 
 @dataclass
