@@ -135,7 +135,7 @@ class FakeDocumentRef:
         self.update_payloads: list[dict[str, Any]] = []
         self.deleted = False
 
-    async def get(self) -> FakeDoc:
+    async def get(self, **kwargs: Any) -> FakeDoc:
         if self.id not in self.store:
             return FakeDoc(exists=False, doc_id=self.id)
         return FakeDoc(self.store[self.id], exists=True, doc_id=self.id)
@@ -176,15 +176,48 @@ class FakeCollection:
         return self._stream()
 
 
+class FakeTransaction:
+    def __init__(self) -> None:
+        self._id: bytes | None = None
+        self._read_only = False
+        self._max_attempts = 1
+        self.committed = False
+        self.rolled_back = False
+
+    def _clean_up(self) -> None:
+        self._id = None
+
+    async def _begin(self, retry_id: bytes | None = None) -> None:
+        self._id = retry_id or b"fake-transaction"
+
+    async def _commit(self) -> None:
+        self.committed = True
+
+    async def _rollback(self) -> None:
+        self.rolled_back = True
+
+    def update(self, reference: FakeDocumentRef, field_updates: dict[str, Any]) -> None:
+        reference.store.setdefault(reference.id, {}).update(field_updates)
+
+    def set(self, reference: FakeDocumentRef, document_data: dict[str, Any]) -> None:
+        reference.store[reference.id] = dict(document_data)
+
+
 class FakeFirestore:
     def __init__(self) -> None:
         self.stores: dict[str, dict[str, dict[str, Any]]] = {}
         self.collections: dict[str, FakeCollection] = {}
+        self.transactions: list[FakeTransaction] = []
 
     def collection(self, name: str) -> FakeCollection:
         self.stores.setdefault(name, {})
         self.collections.setdefault(name, FakeCollection(name, self.stores[name]))
         return self.collections[name]
+
+    def transaction(self) -> FakeTransaction:
+        transaction = FakeTransaction()
+        self.transactions.append(transaction)
+        return transaction
 
 
 def make_user(**overrides: Any):

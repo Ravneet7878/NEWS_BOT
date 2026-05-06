@@ -41,6 +41,103 @@ class TestDatabaseUserAndInviteHelpers:
         assert fake_db.stores["invite_codes"]["JOIN"]["is_used"] is True
         assert fake_db.stores["invite_codes"]["JOIN"]["used_by"] == "123"
 
+    def test_claim_invite_code_creates_user_and_marks_code_used(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+        fake_db.collection("invite_codes")
+        fake_db.stores["invite_codes"]["JOIN"] = {
+            "code": "JOIN",
+            "is_used": False,
+            "used_by": None,
+            "used_at": None,
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": None,
+        }
+        user = make_user(telegram_id="123", invite_code_used="JOIN")
+
+        asyncio.run(db.claim_invite_code_and_create_user("JOIN", "123", user))
+
+        invite = fake_db.stores["invite_codes"]["JOIN"]
+        assert invite["is_used"] is True
+        assert invite["used_by"] == "123"
+        assert isinstance(invite["used_at"], datetime)
+        assert fake_db.stores["users"]["123"]["invite_code_used"] == "JOIN"
+        assert fake_db.transactions[-1].committed is True
+
+    def test_claim_invite_code_maps_missing_invite_to_value_error(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+
+        with pytest.raises(ValueError, match="not_found"):
+            asyncio.run(db.claim_invite_code_and_create_user("MISSING", "123", make_user()))
+
+        assert "123" not in fake_db.stores["users"]
+        assert fake_db.transactions[-1].rolled_back is True
+
+    def test_claim_invite_code_rejects_code_used_by_another_user(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+        fake_db.collection("invite_codes")
+        fake_db.stores["invite_codes"]["JOIN"] = {
+            "code": "JOIN",
+            "is_used": True,
+            "used_by": "999",
+            "used_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": None,
+        }
+
+        with pytest.raises(ValueError, match="already_used"):
+            asyncio.run(db.claim_invite_code_and_create_user("JOIN", "123", make_user(invite_code_used="JOIN")))
+
+        assert "123" not in fake_db.stores["users"]
+
+    def test_claim_invite_code_rejects_expired_invite(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+        fake_db.collection("invite_codes")
+        fake_db.stores["invite_codes"]["JOIN"] = {
+            "code": "JOIN",
+            "is_used": False,
+            "used_by": None,
+            "used_at": None,
+            "created_at": datetime.now(timezone.utc) - timedelta(days=2),
+            "expires_at": datetime.now(timezone.utc) - timedelta(days=1),
+        }
+
+        with pytest.raises(ValueError, match="expired"):
+            asyncio.run(db.claim_invite_code_and_create_user("JOIN", "123", make_user(invite_code_used="JOIN")))
+
+        assert fake_db.stores["invite_codes"]["JOIN"]["is_used"] is False
+        assert "123" not in fake_db.stores["users"]
+
+    def test_claim_invite_code_does_not_overwrite_existing_user(self, fake_db: FakeFirestore, monkeypatch) -> None:
+        import shared.database as db
+
+        monkeypatch.setattr(db, "_db", fake_db)
+        existing_user = make_user(telegram_id="123", first_name="Original", invite_code_used="JOIN")
+        fake_db.collection("users")
+        fake_db.stores["users"]["123"] = existing_user.model_dump(mode="json")
+        fake_db.collection("invite_codes")
+        fake_db.stores["invite_codes"]["JOIN"] = {
+            "code": "JOIN",
+            "is_used": True,
+            "used_by": "123",
+            "used_at": datetime.now(timezone.utc),
+            "created_at": datetime.now(timezone.utc),
+            "expires_at": None,
+        }
+        new_user = make_user(telegram_id="123", first_name="New", invite_code_used="JOIN")
+
+        asyncio.run(db.claim_invite_code_and_create_user("JOIN", "123", new_user))
+
+        assert fake_db.stores["users"]["123"]["first_name"] == "Original"
+        assert fake_db.stores["invite_codes"]["JOIN"]["used_by"] == "123"
+
     def test_queries_skip_malformed_docs_and_apply_filters(self, fake_db: FakeFirestore, monkeypatch) -> None:
         import shared.database as db
 

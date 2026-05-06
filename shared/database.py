@@ -150,7 +150,8 @@ async def _claim_invite_txn(
     """Transactional inner: validate invite, create user, mark code used atomically."""
     from utils.time import as_aware_utc  # local import avoids circular at module level
 
-    invite_snap = await transaction.get(invite_ref)  # type: ignore[union-attr]
+    invite_snap = await invite_ref.get(transaction=transaction)  # type: ignore[attr-defined]
+    user_snap = await user_ref.get(transaction=transaction)  # type: ignore[attr-defined]
     if not invite_snap.exists:
         raise _InviteNotFound()
     invite = invite_snap.to_dict() or {}
@@ -163,7 +164,6 @@ async def _claim_invite_txn(
         invite_ref,
         {"is_used": True, "used_by": telegram_id, "used_at": utc_now()},
     )
-    user_snap = await transaction.get(user_ref)  # type: ignore[union-attr]
     if not user_snap.exists:
         transaction.set(user_ref, new_user_data)  # type: ignore[union-attr]
 
