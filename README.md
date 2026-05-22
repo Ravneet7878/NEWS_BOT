@@ -1,4 +1,4 @@
-# News Bot
+# Khabre Bot
 
 Invite-only multi-user AI news digest bot built with Google ADK, FastAPI, and GCP.
 
